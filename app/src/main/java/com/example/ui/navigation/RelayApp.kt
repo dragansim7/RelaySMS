@@ -116,12 +116,12 @@ fun RelayApp(
     val isExpanded = windowSizeClass.widthSizeClass == WindowWidthSizeClass.Expanded
     val useRail = windowSizeClass.widthSizeClass != WindowWidthSizeClass.Compact
 
-    // Built-in public feeds foreground poller (10s)
+    // Built-in public feeds foreground poller (10s) — temp numbers run on their own cadence below
     LaunchedEffect(lifecycleOwner) {
         repository.ensureInitialized()
         lifecycleOwner.repeatOnLifecycle(Lifecycle.State.STARTED) {
             while (true) {
-                repository.syncAll(force = false)
+                repository.syncAll(force = false, includeTempNumbers = false)
                 delay(10_000L)
             }
         }

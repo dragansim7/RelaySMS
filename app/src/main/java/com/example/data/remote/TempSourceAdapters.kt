@@ -48,6 +48,10 @@ sealed class TempFetchResult {
         val retryAfterMs: Long? = null,
         override val attempts: List<SourceProbeAttempt> = emptyList(),
     ) : TempFetchResult()
+
+    data object SkippedInProgress : TempFetchResult() {
+        override val attempts: List<SourceProbeAttempt> = emptyList()
+    }
 }
 
 private data class CacheEntry(
@@ -62,22 +66,36 @@ data class ParsedTimestamp(
 
 object FlexibleTimestampParser {
 
+    // Exclude `title` so sender links like <a title="1415555123"> never spoof Unix timestamps
     private val attrTimestampRegex = Regex(
-        """(?i)\b(?:data-created|data-time|data-timestamp|data-date|datetime|title)\s*=\s*(?:["']([^"']{4,48})["']|([^\s>"']{4,48}))"""
+        """(?i)\b(?:data-created|data-time|data-timestamp|data-date|datetime)\s*=\s*(?:["']([^"']{4,48})["']|([^\s>"']{4,48}))"""
     )
     private val isoRegex = Regex(
-        """(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2})(?::(\d{2}))?(?:\.(\d+))?(Z|[+-]\d{2}:?\d{2})?"""
+        """(\d{4})[-/](\d{1,2})[-/](\d{1,2})[T ](\d{1,2}):(\d{2})(?::(\d{2}))?(?:\.(\d+))?(Z|[+-]\d{2}:?\d{2})?"""
     )
     private val dmyRegex = Regex(
         """(\d{1,2})[./-](\d{1,2})[./-](\d{4})[T ](\d{1,2}):(\d{2})(?::(\d{2}))?(?:\s*(AM|PM))?""",
         RegexOption.IGNORE_CASE,
     )
-    private val relativeNumericRegex = Regex(
-        """(?i)(\d+)\s*(sec(?:ond)?s?|s|min(?:ute)?s?|m|hour?s?|hr?s?|h|day?s?|d|week?s?|w)(?:\s*ago)?\b"""
+    private val dmyMonthRegex = Regex(
+        """\b(\d{1,2})\s+(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*[,\s]+(\d{4})(?:[,\s]+(\d{1,2}):(\d{2})(?::(\d{2}))?(?:\s*(AM|PM))?)?\b""",
+        RegexOption.IGNORE_CASE,
+    )
+    private val mdyMonthRegex = Regex(
+        """\b(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+(\d{1,2})(?:st|nd|rd|th)?[,\s]+(\d{4})(?:[,\s]+(\d{1,2}):(\d{2})(?::(\d{2}))?(?:\s*(AM|PM))?)?\b""",
+        RegexOption.IGNORE_CASE,
+    )
+    private val relativeAgoRegex = Regex(
+        """(?i)\b(\d+)\s*(sec(?:ond)?s?|s|min(?:ute)?s?|m|hour?s?|hr?s?|h|day?s?|d|week?s?|w)\s+ago\b"""
+    )
+    private val standaloneRelativeRegex = Regex(
+        """(?i)^(\d+)\s*(sec(?:ond)?s?|s|min(?:ute)?s?|m|hour?s?|hr?s?|h|day?s?|d|week?s?|w)(?:\s*ago)?$"""
     )
     private val relativeSingularRegex = Regex(
-        """(?i)\b(?:a|an|one)\s+(few\s+seconds?|sec(?:ond)?|min(?:ute)?|hour|hr|day|week)\s*ago\b"""
+        """(?i)\b(?:a|an|one)\s+(few\s+seconds?|sec(?:ond)?|min(?:ute)?|hour|hr|day|week)\s+ago\b"""
     )
+
+    private const val MIN_VALID_EPOCH_MS = 1_577_836_800_000L // 2020-01-01T00:00:00Z
 
     fun extractFromHtmlOrText(rawHtml: String?, nowMs: Long = System.currentTimeMillis()): ParsedTimestamp {
         if (rawHtml.isNullOrBlank()) return ParsedTimestamp(nowMs, isExplicit = false)
@@ -107,16 +125,21 @@ object FlexibleTimestampParser {
             return ParsedTimestamp((nowMs - 86_400_000L).coerceAtLeast(0L), isExplicit = false)
         }
 
-        // Pure numeric epoch seconds or milliseconds
+        // Pure numeric Unix epoch seconds or milliseconds — validated against sane year range
         trimmed.toLongOrNull()?.let { numeric ->
-            return when {
-                numeric > 1_000_000_000_000L -> ParsedTimestamp(numeric, isExplicit = true)
-                numeric > 1_000_000_000L -> ParsedTimestamp(numeric * 1_000L, isExplicit = true)
-                else -> ParsedTimestamp(nowMs, isExplicit = false)
+            val maxValid = nowMs + 86_400_000L
+            val candidateMs = when {
+                numeric in MIN_VALID_EPOCH_MS..maxValid -> numeric
+                numeric * 1_000L in MIN_VALID_EPOCH_MS..maxValid -> numeric * 1_000L
+                else -> null
             }
+            if (candidateMs != null) {
+                return ParsedTimestamp(candidateMs.coerceAtMost(nowMs), isExplicit = true)
+            }
+            return ParsedTimestamp(nowMs, isExplicit = false)
         }
 
-        // ISO-8601 / SQL date-time (highest fidelity — explicit)
+        // ISO-8601 / SQL date-time (supports - or / and 1-or-2 digit month/day/hour)
         isoRegex.find(trimmed)?.let { m ->
             val year = m.groupValues[1].toIntOrNull() ?: return ParsedTimestamp(nowMs, false)
             val month = m.groupValues[2].toIntOrNull() ?: return ParsedTimestamp(nowMs, false)
@@ -149,6 +172,36 @@ object FlexibleTimestampParser {
             return ParsedTimestamp(parsed, isExplicit = true)
         }
 
+        // "24 Nov 2026 07:05" or "24 November 2026, 5:05 PM"
+        dmyMonthRegex.find(trimmed)?.let { m ->
+            val day = m.groupValues[1].toIntOrNull() ?: return ParsedTimestamp(nowMs, false)
+            val month = monthNameToNumber(m.groupValues[2]) ?: return ParsedTimestamp(nowMs, false)
+            val year = m.groupValues[3].toIntOrNull() ?: return ParsedTimestamp(nowMs, false)
+            var hour = m.groupValues[4].toIntOrNull() ?: 0
+            val minute = m.groupValues[5].toIntOrNull() ?: 0
+            val second = m.groupValues[6].toIntOrNull() ?: 0
+            val amPm = m.groupValues[7].uppercase()
+            if (amPm == "PM" && hour < 12) hour += 12
+            if (amPm == "AM" && hour == 12) hour = 0
+            val parsed = buildEpochMs(year, month, day, hour, minute, second, TimeZone.getTimeZone("UTC"), nowMs)
+            return ParsedTimestamp(parsed, isExplicit = true)
+        }
+
+        // "Nov 24, 2026 17:05" or "November 24th, 2026 5:05 PM"
+        mdyMonthRegex.find(trimmed)?.let { m ->
+            val month = monthNameToNumber(m.groupValues[1]) ?: return ParsedTimestamp(nowMs, false)
+            val day = m.groupValues[2].toIntOrNull() ?: return ParsedTimestamp(nowMs, false)
+            val year = m.groupValues[3].toIntOrNull() ?: return ParsedTimestamp(nowMs, false)
+            var hour = m.groupValues[4].toIntOrNull() ?: 0
+            val minute = m.groupValues[5].toIntOrNull() ?: 0
+            val second = m.groupValues[6].toIntOrNull() ?: 0
+            val amPm = m.groupValues[7].uppercase()
+            if (amPm == "PM" && hour < 12) hour += 12
+            if (amPm == "AM" && hour == 12) hour = 0
+            val parsed = buildEpochMs(year, month, day, hour, minute, second, TimeZone.getTimeZone("UTC"), nowMs)
+            return ParsedTimestamp(parsed, isExplicit = true)
+        }
+
         // Singular natural language: "a minute ago", "an hour ago", "a day ago"
         relativeSingularRegex.find(trimmed)?.let { m ->
             val unit = m.groupValues[1].lowercase()
@@ -163,8 +216,9 @@ object FlexibleTimestampParser {
             return ParsedTimestamp((nowMs - deltaMs).coerceAtLeast(0L), isExplicit = false)
         }
 
-        // Relative English expressions: "5 minutes ago", "2h ago", "12 min"
-        relativeNumericRegex.find(trimmed)?.let { match ->
+        // Relative English expressions: require explicit "ago" OR standalone age string ("5m", "12 mins")
+        val relMatch = relativeAgoRegex.find(trimmed) ?: standaloneRelativeRegex.matchEntire(trimmed)
+        relMatch?.let { match ->
             val amount = match.groupValues[1].toLongOrNull() ?: return ParsedTimestamp(nowMs, false)
             val unit = match.groupValues[2].lowercase()
             val deltaMs = when {
@@ -179,6 +233,22 @@ object FlexibleTimestampParser {
         }
 
         return ParsedTimestamp(nowMs, isExplicit = false)
+    }
+
+    private fun monthNameToNumber(abbrev: String): Int? = when (abbrev.lowercase().take(3)) {
+        "jan" -> 1
+        "feb" -> 2
+        "mar" -> 3
+        "apr" -> 4
+        "may" -> 5
+        "jun" -> 6
+        "jul" -> 7
+        "aug" -> 8
+        "sep" -> 9
+        "oct" -> 10
+        "nov" -> 11
+        "dec" -> 12
+        else -> null
     }
 
     private fun buildEpochMs(
@@ -507,6 +577,7 @@ class Sms24HtmlAdapter(
 
                 client.newCall(request).execute().use { response ->
                     stage1HttpCode = response.code
+                    val finalUrl = response.request.url.toString()
                     val latency = (System.currentTimeMillis() - started).coerceAtLeast(1L)
                     val html = response.body?.string().orEmpty()
                     val snippet = BotWallDetector.buildSnippet(html)
@@ -519,7 +590,7 @@ class Sms24HtmlAdapter(
                             SourceProbeAttempt(
                                 sourceKey = TempNumberEntity.SOURCE_SMS24_ME,
                                 displayName = "SMS24.me (HTTP)",
-                                url = url,
+                                url = finalUrl,
                                 httpCode = response.code,
                                 latencyMs = latency,
                                 payloadBytes = html.toByteArray().size,
@@ -534,6 +605,29 @@ class Sms24HtmlAdapter(
 
                     when (response.code) {
                         in 200..299 -> {
+                            // If SMS24 redirected away from the number page (e.g. to /en/numbers or /en/countries/),
+                            // this number is no longer listed — never misreport it as an empty inbox.
+                            if (!finalUrl.contains(digits)) {
+                                attempts.add(
+                                    SourceProbeAttempt(
+                                        sourceKey = TempNumberEntity.SOURCE_SMS24_ME,
+                                        displayName = "SMS24.me",
+                                        url = finalUrl,
+                                        httpCode = response.code,
+                                        latencyMs = latency,
+                                        payloadBytes = html.toByteArray().size,
+                                        outcome = ProbeOutcome.NOT_FOUND,
+                                        detailMessage = "SMS24.me redirected away from +$digits to $finalUrl",
+                                        responseSnippet = snippet,
+                                    )
+                                )
+                                return@withContext TempFetchResult.Failure(
+                                    status = TempNumberEntity.STATUS_NOT_FOUND,
+                                    errorMessage = "Number +$digits is no longer active on SMS24.me (redirected to $finalUrl).",
+                                    attempts = attempts.toList(),
+                                )
+                            }
+
                             val (parsed, strategy) = parseHtmlWithStrategy(html)
                             val explicitEmpty = isGenuinelyEmptySms24Page(html)
                             stage1WasExplicitEmpty = explicitEmpty
@@ -541,7 +635,7 @@ class Sms24HtmlAdapter(
                                 val attempt = SourceProbeAttempt(
                                     sourceKey = TempNumberEntity.SOURCE_SMS24_ME,
                                     displayName = "SMS24.me",
-                                    url = url,
+                                    url = finalUrl,
                                     httpCode = response.code,
                                     latencyMs = latency,
                                     payloadBytes = html.toByteArray().size,
@@ -572,7 +666,7 @@ class Sms24HtmlAdapter(
                                 SourceProbeAttempt(
                                     sourceKey = TempNumberEntity.SOURCE_SMS24_ME,
                                     displayName = if (shouldTryBrowserFallback) "SMS24.me (HTTP)" else "SMS24.me",
-                                    url = url,
+                                    url = finalUrl,
                                     httpCode = response.code,
                                     latencyMs = latency,
                                     payloadBytes = html.toByteArray().size,
@@ -596,7 +690,7 @@ class Sms24HtmlAdapter(
                                 SourceProbeAttempt(
                                     sourceKey = TempNumberEntity.SOURCE_SMS24_ME,
                                     displayName = "SMS24.me",
-                                    url = url,
+                                    url = finalUrl,
                                     httpCode = 404,
                                     latencyMs = latency,
                                     payloadBytes = html.toByteArray().size,
@@ -616,7 +710,7 @@ class Sms24HtmlAdapter(
                                 SourceProbeAttempt(
                                     sourceKey = TempNumberEntity.SOURCE_SMS24_ME,
                                     displayName = "SMS24.me",
-                                    url = url,
+                                    url = finalUrl,
                                     httpCode = 429,
                                     latencyMs = latency,
                                     outcome = ProbeOutcome.RATE_LIMITED,
@@ -636,7 +730,7 @@ class Sms24HtmlAdapter(
                                 SourceProbeAttempt(
                                     sourceKey = TempNumberEntity.SOURCE_SMS24_ME,
                                     displayName = "SMS24.me",
-                                    url = url,
+                                    url = finalUrl,
                                     httpCode = response.code,
                                     latencyMs = latency,
                                     payloadBytes = html.toByteArray().size,
@@ -697,7 +791,7 @@ class Sms24HtmlAdapter(
             val rendered = browserFetcher.renderAndExtract(
                 url = url,
                 referer = "https://sms24.me/en/numbers",
-                maxWaitMs = 6_500L,
+                maxWaitMs = 7_500L,
             )
             if (rendered != null) {
                 val nowRender = System.currentTimeMillis()
@@ -711,18 +805,23 @@ class Sms24HtmlAdapter(
                     emptyList<TempParsedMessage>() to null
                 }
 
-                val renderedBot = BotWallDetector.detect(200, rendered.outerHtml)
+                val redirectedAway = rendered.finalUrl.isNotBlank() &&
+                    !rendered.finalUrl.contains(digits) &&
+                    rendered.finalUrl != "about:blank"
+                val renderedBot = BotWallDetector.detect(rendered.httpCode ?: 200, rendered.outerHtml)
                 val renderedEmpty = rendered.error == null &&
+                    !redirectedAway &&
                     !renderedBot.isBlocked &&
                     (isGenuinelyEmptySms24Page(rendered.outerHtml) || isGenuinelyEmptySms24Page(rendered.visibleTextSnippet))
                 val snippetText = buildString {
                     if (rendered.title.isNotBlank()) append("[${rendered.title}] ")
                     if (rendered.domSummary.isNotBlank()) append("[${rendered.domSummary}] ")
                     append(rendered.visibleTextSnippet)
-                }.take(420)
+                }.take(480)
 
                 val domOutcome = when {
                     finalMsgs.isNotEmpty() -> ProbeOutcome.SUCCESS_WITH_MESSAGES
+                    redirectedAway -> ProbeOutcome.NOT_FOUND
                     rendered.error != null -> ProbeOutcome.ERROR
                     renderedBot.isBlocked -> ProbeOutcome.BOT_BLOCKED
                     renderedEmpty -> ProbeOutcome.EMPTY_INBOX
@@ -734,7 +833,7 @@ class Sms24HtmlAdapter(
                         sourceKey = TempNumberEntity.SOURCE_SMS24_ME,
                         displayName = "SMS24.me (Live Chromium DOM)",
                         url = rendered.finalUrl,
-                        httpCode = if (rendered.error == null) 200 else stage1HttpCode,
+                        httpCode = if (rendered.error == null) (rendered.httpCode ?: 200) else stage1HttpCode,
                         latencyMs = rendered.latencyMs,
                         payloadBytes = rendered.outerHtml.toByteArray().size,
                         botChallengeDetected = renderedBot.isBlocked,
@@ -743,6 +842,7 @@ class Sms24HtmlAdapter(
                         outcome = domOutcome,
                         detailMessage = when (domOutcome) {
                             ProbeOutcome.SUCCESS_WITH_MESSAGES -> "Extracted ${finalMsgs.size} live messages via $strategyLabel (${rendered.domSummary})"
+                            ProbeOutcome.NOT_FOUND -> "Chromium redirected away from +$digits to ${rendered.finalUrl}"
                             ProbeOutcome.EMPTY_INBOX -> "Live rendered page confirmed empty inbox (${rendered.domSummary})"
                             ProbeOutcome.BOT_BLOCKED -> renderedBot.reason ?: "Cloudflare/anti-bot wall persisted in Chromium"
                             ProbeOutcome.ERROR -> rendered.error ?: "Chromium DOM load failed"
@@ -760,6 +860,13 @@ class Sms24HtmlAdapter(
                     )
                     cache[digits] = CacheEntry(System.currentTimeMillis(), success)
                     return success
+                }
+                if (domOutcome == ProbeOutcome.NOT_FOUND) {
+                    return TempFetchResult.Failure(
+                        status = TempNumberEntity.STATUS_NOT_FOUND,
+                        errorMessage = "SMS24.me redirected away from +$digits to ${rendered.finalUrl}.",
+                        attempts = attempts.toList(),
+                    )
                 }
                 if (domOutcome == ProbeOutcome.EMPTY_INBOX) {
                     return TempFetchResult.Success(
@@ -798,10 +905,11 @@ class Sms24HtmlAdapter(
         }
     }
 
-    private fun isGenuinelyEmptySms24Page(html: String): Boolean {
+    internal fun isGenuinelyEmptySms24Page(html: String): Boolean {
         if (html.isBlank()) return false
-        val lower = html.lowercase()
-        // Never declare empty if message DOM markers exist in the HTML
+        val visibleHtml = BotWallDetector.stripNonVisibleTags(html)
+        val lower = visibleHtml.lowercase()
+        // Never declare empty if message DOM markers exist in visible HTML
         val hasMessageMarkers = lower.contains("data-created=") ||
             lower.contains("/messages/") ||
             lower.contains("class=\"placeholder") ||
@@ -814,7 +922,7 @@ class Sms24HtmlAdapter(
             lower.contains("no messages yet") ||
             lower.contains("inbox is empty") ||
             lower.contains("currently no messages") ||
-            (html.length < 2_000 && (lower.contains("no messages") || lower.contains("no sms")))
+            (visibleHtml.length < 2_000 && (lower.contains("no messages") || lower.contains("no sms")))
     }
 
     internal fun parseHtml(html: String, nowMs: Long = System.currentTimeMillis()): List<TempParsedMessage> {
@@ -825,12 +933,12 @@ class Sms24HtmlAdapter(
         html: String,
         nowMs: Long = System.currentTimeMillis(),
     ): Pair<List<TempParsedMessage>, String?> {
-        // Strategy A1: Classic <dt>...</dt><dd>...</dd>
+        // Strategy A1: Classic <dt ...>...</dt><dd ...>...</dd> (preserving <dt> tag attributes!)
         val dtDdOut = mutableListOf<TempParsedMessage>()
         for (match in dtDdRegex.findAll(html)) {
-            val dtRawHtml = match.groupValues[1]
+            val dtFullTag = match.groupValues[1]
             val ddBlock = match.groupValues[2]
-            parseDdBlock(ddBlock = ddBlock, precedingContext = dtRawHtml, nowMs = nowMs)?.let { dtDdOut.add(it) }
+            parseDdBlock(ddBlock = ddBlock, precedingContext = dtFullTag, nowMs = nowMs)?.let { dtDdOut.add(it) }
         }
         if (dtDdOut.isNotEmpty()) return dedupeParsed(dtDdOut) to "dl-dt-dd-balanced"
 
@@ -839,13 +947,17 @@ class Sms24HtmlAdapter(
         if (ddBlocks.isNotEmpty()) {
             val relaxedOut = mutableListOf<TempParsedMessage>()
             for ((range, inner) in ddBlocks) {
-                val lookbackStart = (range.first - 500).coerceAtLeast(0)
+                val lookbackStart = (range.first - 600).coerceAtLeast(0)
                 val lookback = html.substring(lookbackStart, range.first)
-                val lastDt = dtOnlyRegex.findAll(lookback).lastOrNull()?.groupValues?.getOrNull(1) ?: lookback
+                val lastDt = dtFullRegex.findAll(lookback).lastOrNull()?.value ?: lookback
                 parseDdBlock(ddBlock = inner, precedingContext = lastDt, nowMs = nowMs)?.let { relaxedOut.add(it) }
             }
             if (relaxedOut.isNotEmpty()) return dedupeParsed(relaxedOut) to "dd-relaxed-balanced"
         }
+
+        // Strategy A3: HTML5 minified <dt>...<dd>... without optional </dt> / </dd> closing tags
+        val unclosedOut = parseUnclosedDtDd(html, nowMs)
+        if (unclosedOut.isNotEmpty()) return dedupeParsed(unclosedOut) to "dd-unclosed-html5"
 
         // Strategy B: Universal SMS24 `From:` / `/messages/` sender link anchor parser (layout & class agnostic!)
         val anchorOut = parseByFromMessageAnchors(html, nowMs)
@@ -872,39 +984,19 @@ class Sms24HtmlAdapter(
         val cardOut = mutableListOf<TempParsedMessage>()
         for (block in cardBlocks) {
             if (block.length > 4_000) continue
-            val ts = FlexibleTimestampParser.extractFromHtmlOrText(
-                timeRegex.find(block)?.value ?: block,
-                nowMs,
-            )
+            val ts = extractExplicitOrTimeTagTimestamp(block, nowMs)
             val labelBlock = fromLabelRegex.find(block)?.groupValues?.getOrNull(1).orEmpty()
             val senderRaw = fromLinkRegex.find(labelBlock)?.groupValues?.getOrNull(1)
                 ?: messageHrefLinkRegex.find(block)?.groupValues?.getOrNull(1)
                 ?: strongRegex.find(block)?.groupValues?.getOrNull(1)
                 ?: labelBlock
-            val bodyRaw = BalancedHtmlExtractor.extractBalancedElements(
-                html = block,
-                tagName = "span",
-                openTagRegex = placeholderSpanOpenRegex,
-            ).firstOrNull()
-                ?: BalancedHtmlExtractor.extractBalancedElements(
-                    html = block,
-                    tagName = "div",
-                    openTagRegex = textBreakDivOpenRegex,
-                ).firstOrNull()
-                ?: pTagRegex.find(block)?.groupValues?.getOrNull(1)
-                ?: if (labelBlock.isNotBlank()) block.replace(fullLabelBlockRegex, " ").replace(timeRegex, " ") else ""
-            val body = PhoneFormatter.sanitizeBody(HtmlEntityDecoder.decodeHtml(bodyRaw), 640)
-            if (body.length < 3) continue
-            val sender = HtmlEntityDecoder.decodeHtml(senderRaw)
-                .replace(Regex("""(?i)^from\s*:?\s*"""), "")
-                .trim()
-                .take(40)
-                .ifEmpty { PhoneFormatter.guessSender("", body).ifEmpty { "SMS24" } }
-            if (body.equals(sender, ignoreCase = true)) continue
+            val sender = cleanSender(senderRaw)
+            val body = extractBestBodyFromContainer(block, sender) ?: continue
+            val effectiveSender = sender.ifEmpty { PhoneFormatter.guessSender("", body).ifEmpty { "SMS24" } }
             cardOut.add(
                 TempParsedMessage(
-                    fromNumber = sender.take(32),
-                    senderName = sender,
+                    fromNumber = effectiveSender.take(32),
+                    senderName = effectiveSender,
                     body = body,
                     receivedAtEpochMs = ts.epochMs,
                     hasExplicitTimestamp = ts.isExplicit,
@@ -925,13 +1017,40 @@ class Sms24HtmlAdapter(
         return emptyList<TempParsedMessage>() to null
     }
 
+    private fun parseUnclosedDtDd(html: String, nowMs: Long): List<TempParsedMessage> {
+        val ddStarts = ddOpenRegex.findAll(html).toList()
+        if (ddStarts.isEmpty()) return emptyList()
+        val out = mutableListOf<TempParsedMessage>()
+        for (i in ddStarts.indices) {
+            val openMatch = ddStarts[i]
+            val contentStart = openMatch.range.last + 1
+            val nextDdStart = ddStarts.getOrNull(i + 1)?.range?.first ?: html.length
+            val nextBoundary = listOfNotNull(
+                dtOpenRegex.find(html, contentStart)?.range?.first,
+                dlCloseRegex.find(html, contentStart)?.range?.first,
+                ddCloseRegex.find(html, contentStart)?.range?.first,
+                nextDdStart,
+            ).minOrNull()?.coerceAtMost((contentStart + 2_500).coerceAtMost(html.length)) ?: nextDdStart
+            if (nextBoundary <= contentStart) continue
+            val ddInner = html.substring(contentStart, nextBoundary)
+            val lookbackStart = (openMatch.range.first - 600).coerceAtLeast(0)
+            val lookback = html.substring(lookbackStart, openMatch.range.first)
+            val dtStartIdx = dtOpenRegex.findAll(lookback).lastOrNull()?.range?.first ?: 0
+            val preceding = lookback.substring(dtStartIdx)
+            parseDdBlock(ddBlock = ddInner, precedingContext = preceding, nowMs = nowMs)?.let { out.add(it) }
+        }
+        return out
+    }
+
     private fun parseDdBlock(
         ddBlock: String,
         precedingContext: String,
         nowMs: Long,
     ): TempParsedMessage? {
-        val tsInside = FlexibleTimestampParser.extractFromHtmlOrText(ddBlock, nowMs)
+        // Extract timestamp strictly from <dt>/preceding context or explicit time tags/attributes inside <dd>
+        // (NEVER scan the SMS body text itself so phrases like "Valid for 7 days" cannot backdate the SMS!)
         val tsBefore = FlexibleTimestampParser.extractFromHtmlOrText(precedingContext, nowMs)
+        val tsInside = extractExplicitOrTimeTagTimestamp(ddBlock, nowMs)
         val ts = when {
             tsBefore.isExplicit -> tsBefore
             tsInside.isExplicit -> tsInside
@@ -943,35 +1062,86 @@ class Sms24HtmlAdapter(
         val senderRaw = fromLinkRegex.find(labelBlock)?.groupValues?.getOrNull(1)
             ?: messageHrefLinkRegex.find(ddBlock)?.groupValues?.getOrNull(1)
             ?: labelBlock.ifBlank { fromLinkRegex.find(ddBlock)?.groupValues?.getOrNull(1).orEmpty() }
+        val sender = cleanSender(senderRaw)
 
-        val bodyRaw = BalancedHtmlExtractor.extractBalancedElements(
-            html = ddBlock,
-            tagName = "span",
-            openTagRegex = placeholderSpanOpenRegex,
-        ).firstOrNull()
-            ?: BalancedHtmlExtractor.extractBalancedElements(
-                html = ddBlock,
-                tagName = "div",
-                openTagRegex = textBreakDivOpenRegex,
-            ).firstOrNull()
-            ?: pTagRegex.find(ddBlock)?.groupValues?.getOrNull(1)
-            ?: ddBlock.replace(fullLabelBlockRegex, " ").replace(timeRegex, " ")
-
-        val body = PhoneFormatter.sanitizeBody(HtmlEntityDecoder.decodeHtml(bodyRaw), 640)
-        if (body.length < 2) return null
-        val sender = HtmlEntityDecoder.decodeHtml(senderRaw)
-            .replace(Regex("""(?i)^from\s*:?\s*"""), "")
-            .trim()
-            .take(40)
-            .ifEmpty { PhoneFormatter.guessSender("", body).ifEmpty { "SMS24" } }
+        val body = extractBestBodyFromContainer(ddBlock, sender) ?: return null
+        val effectiveSender = sender.ifEmpty { PhoneFormatter.guessSender("", body).ifEmpty { "SMS24" } }
         return TempParsedMessage(
-            fromNumber = sender.take(32),
-            senderName = sender,
+            fromNumber = effectiveSender.take(32),
+            senderName = effectiveSender,
             body = body,
             receivedAtEpochMs = ts.epochMs,
             hasExplicitTimestamp = ts.isExplicit,
             sourceTag = "sms24",
         )
+    }
+
+    private fun extractExplicitOrTimeTagTimestamp(block: String, nowMs: Long): ParsedTimestamp {
+        // Check explicit data-created / datetime attributes first
+        val attrTs = FlexibleTimestampParser.extractFromHtmlOrText(
+            dataCreatedAttrRegex.find(block)?.value ?: "",
+            nowMs,
+        )
+        if (attrTs.isExplicit) return attrTs
+        // Then check dedicated <small> / <time> / .text-muted tags (excluding the message body)
+        val timeTag = timeRegex.find(block)?.value
+        if (!timeTag.isNullOrBlank()) {
+            return FlexibleTimestampParser.extractFromHtmlOrText(timeTag, nowMs)
+        }
+        return ParsedTimestamp(nowMs, isExplicit = false)
+    }
+
+    private fun cleanSender(raw: String): String {
+        return HtmlEntityDecoder.decodeHtml(raw)
+            .replace(Regex("""(?i)^from\s*:?\s*"""), "")
+            .trim()
+            .take(40)
+    }
+
+    /**
+     * Strips <label>...</label>, sender /messages/ links, and time tags BEFORE scanning for the
+     * SMS body so `<a class="placeholder ms-1">Sender</a>` or an empty badge `<span></span>`
+     * can NEVER shadow the actual `<span class="placeholder text-break">` or plain `<span>` body.
+     */
+    private fun extractBestBodyFromContainer(containerHtml: String, sender: String): String? {
+        val strippedMeta = containerHtml
+            .replace(fullLabelBlockRegex, " ")
+            .replace(messageHrefFullAnchorRegex, " ")
+            .replace(timeRegex, " ")
+
+        val candidates = mutableListOf<String>()
+        candidates.addAll(
+            BalancedHtmlExtractor.extractBalancedElements(
+                html = strippedMeta,
+                tagName = "span",
+                openTagRegex = placeholderSpanOpenRegex,
+            )
+        )
+        candidates.addAll(
+            BalancedHtmlExtractor.extractBalancedElements(
+                html = strippedMeta,
+                tagName = "div",
+                openTagRegex = textBreakDivOpenRegex,
+            )
+        )
+        candidates.addAll(
+            BalancedHtmlExtractor.extractBalancedElements(
+                html = strippedMeta,
+                tagName = "span",
+                openTagRegex = anySpanOpenRegex,
+            )
+        )
+        pTagRegex.findAll(strippedMeta).forEach { candidates.add(it.groupValues[1]) }
+        candidates.add(strippedMeta)
+
+        for (raw in candidates) {
+            val cleaned = PhoneFormatter.sanitizeBody(HtmlEntityDecoder.decodeHtml(raw), 640)
+            if (cleaned.length < 2) continue
+            if (sender.isNotBlank() && cleaned.equals(sender, ignoreCase = true)) continue
+            if (cleaned.equals("From:", ignoreCase = true) || cleaned.equals("From", ignoreCase = true)) continue
+            return cleaned
+        }
+        return null
     }
 
     private fun parseByFromMessageAnchors(html: String, nowMs: Long): List<TempParsedMessage> {
@@ -982,36 +1152,22 @@ class Sms24HtmlAdapter(
         for (i in matches.indices) {
             val m = matches[i]
             val senderRaw = m.groupValues.drop(1).firstOrNull { it.isNotBlank() }.orEmpty()
-            val sender = HtmlEntityDecoder.decodeHtml(senderRaw)
-                .replace(Regex("""(?i)^from\s*:?\s*"""), "")
-                .trim()
-                .take(40)
+            val sender = cleanSender(senderRaw)
             if (sender.isBlank()) continue
 
             val nextStart = if (i + 1 < matches.size) matches[i + 1].range.first else (m.range.last + 1_200).coerceAtMost(html.length)
             val afterSlice = html.substring((m.range.last + 1).coerceAtMost(html.length), nextStart.coerceAtMost(m.range.last + 1_200))
-            val beforeStart = (m.range.first - 450).coerceAtLeast(if (i > 0) matches[i - 1].range.last + 1 else 0)
+                .substringBefore("</dd>")
+                .substringBefore("</li>")
+                .substringBefore("</article>")
+            val beforeStart = (m.range.first - 500).coerceAtLeast(if (i > 0) matches[i - 1].range.last + 1 else 0)
             val beforeSlice = html.substring(beforeStart, m.range.first)
 
-            val bodyRaw = BalancedHtmlExtractor.extractBalancedElements(
-                html = afterSlice,
-                tagName = "span",
-                openTagRegex = placeholderSpanOpenRegex,
-            ).firstOrNull()
-                ?: BalancedHtmlExtractor.extractBalancedElements(
-                    html = afterSlice,
-                    tagName = "div",
-                    openTagRegex = textBreakDivOpenRegex,
-                ).firstOrNull()
-                ?: pTagRegex.find(afterSlice)?.groupValues?.getOrNull(1)
-                ?: afterSlice.substringBefore("</dd>").substringBefore("</li>").substringBefore("</article>")
-                    .replace(timeRegex, " ")
-
-            val body = PhoneFormatter.sanitizeBody(HtmlEntityDecoder.decodeHtml(bodyRaw), 640)
-            if (body.length < 3 || body.equals(sender, ignoreCase = true)) continue
+            val body = extractBestBodyFromContainer(afterSlice, sender) ?: continue
+            if (body.length < 3) continue
 
             val tsBefore = FlexibleTimestampParser.extractFromHtmlOrText(beforeSlice, nowMs)
-            val tsAfter = FlexibleTimestampParser.extractFromHtmlOrText(afterSlice, nowMs)
+            val tsAfter = extractExplicitOrTimeTagTimestamp(afterSlice, nowMs)
             val ts = when {
                 tsBefore.isExplicit -> tsBefore
                 tsAfter.isExplicit -> tsAfter
@@ -1050,31 +1206,15 @@ class Sms24HtmlAdapter(
                 ?: messageHrefLinkRegex.find(slice)?.groupValues?.getOrNull(1)
                 ?: strongRegex.find(slice)?.groupValues?.getOrNull(1)
                 ?: labelBlock
-            val bodyRaw = BalancedHtmlExtractor.extractBalancedElements(
-                html = slice,
-                tagName = "span",
-                openTagRegex = placeholderSpanOpenRegex,
-            ).firstOrNull()
-                ?: BalancedHtmlExtractor.extractBalancedElements(
-                    html = slice,
-                    tagName = "div",
-                    openTagRegex = textBreakDivOpenRegex,
-                ).firstOrNull()
-                ?: pTagRegex.find(slice)?.groupValues?.getOrNull(1)
-                ?: ""
-
-            val body = PhoneFormatter.sanitizeBody(HtmlEntityDecoder.decodeHtml(bodyRaw), 640)
+            val sender = cleanSender(senderRaw)
+            val body = extractBestBodyFromContainer(slice, sender) ?: continue
             if (body.length < 3) continue
-            val sender = HtmlEntityDecoder.decodeHtml(senderRaw)
-                .replace(Regex("""(?i)^from\s*:?\s*"""), "")
-                .trim()
-                .take(40)
-                .ifEmpty { PhoneFormatter.guessSender("", body).ifEmpty { "SMS24" } }
+            val effectiveSender = sender.ifEmpty { PhoneFormatter.guessSender("", body).ifEmpty { "SMS24" } }
 
             out.add(
                 TempParsedMessage(
-                    fromNumber = sender.take(32),
-                    senderName = sender,
+                    fromNumber = effectiveSender.take(32),
+                    senderName = effectiveSender,
                     body = body,
                     receivedAtEpochMs = ts.epochMs,
                     hasExplicitTimestamp = ts.isExplicit,
@@ -1135,16 +1275,25 @@ class Sms24HtmlAdapter(
 
     companion object {
         private const val CACHE_TTL_MS = 15_000L
-        private val dtDdRegex = Regex("""<dt[^>]*>([\s\S]*?)</dt>\s*<dd[^>]*>([\s\S]*?)</dd>""", RegexOption.IGNORE_CASE)
-        private val dtOnlyRegex = Regex("""<dt[^>]*>([\s\S]*?)</dt>""", RegexOption.IGNORE_CASE)
+        // Capture full <dt ...>...</dt> so attributes like <dt data-created="..."> are preserved
+        private val dtDdRegex = Regex("""(<dt\b[^>]*>[\s\S]*?</dt>)\s*<dd\b[^>]*>([\s\S]*?)</dd>""", RegexOption.IGNORE_CASE)
+        private val dtFullRegex = Regex("""<dt\b[^>]*>[\s\S]*?</dt>""", RegexOption.IGNORE_CASE)
+        private val dtOpenRegex = Regex("""<dt\b[^>]*>""", RegexOption.IGNORE_CASE)
         private val ddOpenRegex = Regex("""<dd\b[^>]*>""", RegexOption.IGNORE_CASE)
+        private val ddCloseRegex = Regex("""</dd\s*>""", RegexOption.IGNORE_CASE)
+        private val dlCloseRegex = Regex("""</dl\s*>""", RegexOption.IGNORE_CASE)
+        private val anySpanOpenRegex = Regex("""<span\b[^>]*>""", RegexOption.IGNORE_CASE)
         private val fromLinkRegex = Regex("""<a[^>]*>([\s\S]*?)</a>""", RegexOption.IGNORE_CASE)
         private val messageHrefLinkRegex = Regex(
             """<a[^>]*href\s*=\s*["']?[^"'\s>]*/messages?/[^"'\s>]+["']?[^>]*>([\s\S]*?)</a>""",
             RegexOption.IGNORE_CASE,
         )
+        private val messageHrefFullAnchorRegex = Regex(
+            """<a[^>]*href\s*=\s*["']?[^"'\s>]*/messages?/[^"'\s>]+["']?[^>]*>[\s\S]*?</a>""",
+            RegexOption.IGNORE_CASE,
+        )
         private val fromAnchorRegex = Regex(
-            """(?:<label[^>]*>\s*From\s*:?\s*(?:<a[^>]*>([\s\S]*?)</a>|([^<]{1,60}))\s*</label>|From\s*:\s*<a[^>]*>([\s\S]*?)</a>|<a[^>]*href\s*=\s*["']?/[a-z]{2}/messages?/[^"'\s>]+["']?[^>]*>([\s\S]*?)</a>)""",
+            """(?:<label[^>]*>\s*From\s*:?\s*(?:<a[^>]*>([\s\S]*?)</a>|([^<]{1,60}))\s*</label>|From\s*:\s*<a[^>]*>([\s\S]*?)</a>|<a[^>]*href\s*=\s*["']?(?:https?://[^"'\s>]+)?/(?:[a-z]{2}/)?messages?/[^"'\s>]+["']?[^>]*>([\s\S]*?)</a>)""",
             RegexOption.IGNORE_CASE,
         )
         private val dataCreatedAttrRegex = Regex(
@@ -1564,18 +1713,20 @@ class TempSourceEngine(
 
     private val perNumberLocks = ConcurrentHashMap<String, Mutex>()
 
+    fun isSyncInProgress(numberId: String): Boolean = perNumberLocks[numberId]?.isLocked == true
+
     suspend fun fetchForTempNumber(
         temp: TempNumberEntity,
         customSource: CustomSourceEntity?,
         force: Boolean = false,
     ): TempFetchResult {
         val lock = perNumberLocks.getOrPut(temp.numberId) { Mutex() }
-        if (!lock.tryLock()) {
-            return TempFetchResult.Success(
-                messages = emptyList(),
-                resolvedSource = temp.resolvedSource ?: temp.sourceType,
-                fromCache = true,
-            )
+        if (force) {
+            lock.lock()
+        } else if (!lock.tryLock()) {
+            // Never return a fake Success(emptyList()) on lock contention — that overwrote
+            // DB status to STATUS_ONLINE (green) with 0 messages while a real fetch was running!
+            return TempFetchResult.SkippedInProgress
         }
         return try {
             when (temp.sourceType) {

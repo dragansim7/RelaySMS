@@ -45,6 +45,7 @@ class ReceiveSmssMirrorAdapter(private val client: OkHttpClient) {
                 ).build()
 
                 client.newCall(request).execute().use { response ->
+                    val finalUrl = response.request.url.toString()
                     val latency = (System.currentTimeMillis() - started).coerceAtLeast(1L)
                     val html = response.body?.string().orEmpty()
                     val snippet = BotWallDetector.buildSnippet(html)
@@ -54,7 +55,7 @@ class ReceiveSmssMirrorAdapter(private val client: OkHttpClient) {
                         val attempt = SourceProbeAttempt(
                             sourceKey = TempNumberEntity.SOURCE_RECEIVE_SMSS_MIRROR,
                             displayName = "Receive-SMSS.live",
-                            url = url,
+                            url = finalUrl,
                             httpCode = response.code,
                             latencyMs = latency,
                             payloadBytes = html.toByteArray().size,
@@ -72,18 +73,44 @@ class ReceiveSmssMirrorAdapter(private val client: OkHttpClient) {
 
                     when (response.code) {
                         in 200..299 -> {
+                            val redirectedOffNumber = finalUrl != url &&
+                                !finalUrl.contains(digits) &&
+                                !finalUrl.contains(digits.takeLast(9))
+                            if (redirectedOffNumber) {
+                                val attempt = SourceProbeAttempt(
+                                    sourceKey = TempNumberEntity.SOURCE_RECEIVE_SMSS_MIRROR,
+                                    displayName = "Receive-SMSS.live",
+                                    url = finalUrl,
+                                    httpCode = response.code,
+                                    latencyMs = latency,
+                                    payloadBytes = html.toByteArray().size,
+                                    outcome = ProbeOutcome.NOT_FOUND,
+                                    detailMessage = "Redirected away from +$digits to $finalUrl",
+                                    responseSnippet = snippet,
+                                )
+                                return@withContext TempFetchResult.Failure(
+                                    status = TempNumberEntity.STATUS_NOT_FOUND,
+                                    errorMessage = "Number not listed on Receive-SMSS.live (redirected).",
+                                    attempts = listOf(attempt),
+                                )
+                            }
+
                             val (parsed, strategy) = parseHtmlWithStrategy(html)
-                            val lower = html.lowercase()
-                            val explicitEmpty = lower.contains("no messages") || lower.contains("no sms") || lower.contains("empty")
+                            val visibleLower = BotWallDetector.stripNonVisibleTags(html).lowercase()
+                            val explicitEmpty = visibleLower.contains("has not received") ||
+                                visibleLower.contains("no sms received") ||
+                                visibleLower.contains("no messages received") ||
+                                visibleLower.contains("no messages yet") ||
+                                visibleLower.contains("inbox is empty")
                             val outcome = when {
                                 parsed.isNotEmpty() -> ProbeOutcome.SUCCESS_WITH_MESSAGES
-                                explicitEmpty || html.length < 1_500 -> ProbeOutcome.EMPTY_INBOX
+                                explicitEmpty -> ProbeOutcome.EMPTY_INBOX
                                 else -> ProbeOutcome.PARSE_MISMATCH
                             }
                             val attempt = SourceProbeAttempt(
                                 sourceKey = TempNumberEntity.SOURCE_RECEIVE_SMSS_MIRROR,
                                 displayName = "Receive-SMSS.live",
-                                url = url,
+                                url = finalUrl,
                                 httpCode = response.code,
                                 latencyMs = latency,
                                 payloadBytes = html.toByteArray().size,
@@ -97,6 +124,13 @@ class ReceiveSmssMirrorAdapter(private val client: OkHttpClient) {
                                 },
                                 responseSnippet = snippet,
                             )
+                            if (outcome == ProbeOutcome.PARSE_MISMATCH) {
+                                return@withContext TempFetchResult.Failure(
+                                    status = TempNumberEntity.STATUS_ERROR,
+                                    errorMessage = "Receive-SMSS.live loaded HTTP 200 but matched 0 SMS blocks.",
+                                    attempts = listOf(attempt),
+                                )
+                            }
                             val result = TempFetchResult.Success(
                                 messages = parsed,
                                 resolvedSource = TempNumberEntity.SOURCE_RECEIVE_SMSS_MIRROR,
@@ -285,6 +319,7 @@ open class GenericHtmlSmsHostAdapter(
                     ).build()
 
                     client.newCall(request).execute().use { response ->
+                        val finalUrl = response.request.url.toString()
                         val latency = (System.currentTimeMillis() - started).coerceAtLeast(1L)
                         val html = response.body?.string().orEmpty()
                         val snippet = BotWallDetector.buildSnippet(html)
@@ -295,7 +330,7 @@ open class GenericHtmlSmsHostAdapter(
                                 SourceProbeAttempt(
                                     sourceKey = sourceKey,
                                     displayName = displayName,
-                                    url = url,
+                                    url = finalUrl,
                                     httpCode = response.code,
                                     latencyMs = latency,
                                     payloadBytes = html.toByteArray().size,
@@ -311,48 +346,75 @@ open class GenericHtmlSmsHostAdapter(
                                 attempts = attempts.toList(),
                             )
                         } else if (response.code in 200..299) {
-                            val (parsed, strategy) = parseHostHtml(html)
-                            val lower = html.lowercase()
-                            val explicitEmpty = lower.contains("has not received") || lower.contains("no sms received") || lower.contains("inbox is empty")
-                            val outcome = when {
-                                parsed.isNotEmpty() -> ProbeOutcome.SUCCESS_WITH_MESSAGES
-                                explicitEmpty || html.length < 1_500 -> ProbeOutcome.EMPTY_INBOX
-                                else -> ProbeOutcome.PARSE_MISMATCH
-                            }
-                            attempts.add(
-                                SourceProbeAttempt(
-                                    sourceKey = sourceKey,
-                                    displayName = displayName,
-                                    url = url,
-                                    httpCode = response.code,
-                                    latencyMs = latency,
-                                    payloadBytes = html.toByteArray().size,
-                                    parserStrategy = strategy,
-                                    parsedCount = parsed.size,
-                                    outcome = outcome,
-                                    detailMessage = when (outcome) {
-                                        ProbeOutcome.SUCCESS_WITH_MESSAGES -> "Parsed ${parsed.size} messages via $strategy"
-                                        ProbeOutcome.EMPTY_INBOX -> "$displayName page loaded with 0 messages"
-                                        else -> "Page returned ${html.length} chars with 0 matched SMS entries"
-                                    },
-                                    responseSnippet = snippet,
+                            val redirectedOffNumber = finalUrl != url &&
+                                !finalUrl.contains(digits) &&
+                                !finalUrl.contains(digits.takeLast(9))
+                            if (redirectedOffNumber) {
+                                attempts.add(
+                                    SourceProbeAttempt(
+                                        sourceKey = sourceKey,
+                                        displayName = displayName,
+                                        url = finalUrl,
+                                        httpCode = response.code,
+                                        latencyMs = latency,
+                                        payloadBytes = html.toByteArray().size,
+                                        outcome = ProbeOutcome.NOT_FOUND,
+                                        detailMessage = "Redirected away from +$digits to $finalUrl",
+                                        responseSnippet = snippet,
+                                    )
                                 )
-                            )
-                            if (parsed.isNotEmpty()) {
-                                val success = TempFetchResult.Success(
-                                    messages = parsed,
-                                    resolvedSource = sourceKey,
-                                    attempts = attempts.toList(),
-                                )
-                                cache[digits] = MirrorCacheEntry(System.currentTimeMillis(), success)
-                                return@withContext success
-                            }
-                            if (outcome == ProbeOutcome.PARSE_MISMATCH) {
                                 lastFailure = TempFetchResult.Failure(
-                                    status = TempNumberEntity.STATUS_ERROR,
-                                    errorMessage = "$displayName loaded (HTTP 200) but matched 0 SMS blocks.",
+                                    status = TempNumberEntity.STATUS_NOT_FOUND,
+                                    errorMessage = "Number not listed on $displayName (redirected).",
                                     attempts = attempts.toList(),
                                 )
+                            } else {
+                                val (parsed, strategy) = parseHostHtml(html)
+                                val visibleLower = BotWallDetector.stripNonVisibleTags(html).lowercase()
+                                val explicitEmpty = visibleLower.contains("has not received") ||
+                                    visibleLower.contains("no sms received") ||
+                                    visibleLower.contains("no messages received") ||
+                                    visibleLower.contains("inbox is empty")
+                                val outcome = when {
+                                    parsed.isNotEmpty() -> ProbeOutcome.SUCCESS_WITH_MESSAGES
+                                    explicitEmpty -> ProbeOutcome.EMPTY_INBOX
+                                    else -> ProbeOutcome.PARSE_MISMATCH
+                                }
+                                attempts.add(
+                                    SourceProbeAttempt(
+                                        sourceKey = sourceKey,
+                                        displayName = displayName,
+                                        url = finalUrl,
+                                        httpCode = response.code,
+                                        latencyMs = latency,
+                                        payloadBytes = html.toByteArray().size,
+                                        parserStrategy = strategy,
+                                        parsedCount = parsed.size,
+                                        outcome = outcome,
+                                        detailMessage = when (outcome) {
+                                            ProbeOutcome.SUCCESS_WITH_MESSAGES -> "Parsed ${parsed.size} messages via $strategy"
+                                            ProbeOutcome.EMPTY_INBOX -> "$displayName page loaded with 0 messages"
+                                            else -> "Page returned ${html.length} chars with 0 matched SMS entries"
+                                        },
+                                        responseSnippet = snippet,
+                                    )
+                                )
+                                if (parsed.isNotEmpty()) {
+                                    val success = TempFetchResult.Success(
+                                        messages = parsed,
+                                        resolvedSource = sourceKey,
+                                        attempts = attempts.toList(),
+                                    )
+                                    cache[digits] = MirrorCacheEntry(System.currentTimeMillis(), success)
+                                    return@withContext success
+                                }
+                                if (outcome == ProbeOutcome.PARSE_MISMATCH) {
+                                    lastFailure = TempFetchResult.Failure(
+                                        status = TempNumberEntity.STATUS_ERROR,
+                                        errorMessage = "$displayName loaded (HTTP 200) but matched 0 SMS blocks.",
+                                        attempts = attempts.toList(),
+                                    )
+                                }
                             }
                         } else {
                             val outcome = when (response.code) {
@@ -689,6 +751,7 @@ class PublicSmsMirrorAdapter(
                     allAttempts.addAll(res.attempts)
                     lastFailure = res
                 }
+                TempFetchResult.SkippedInProgress -> Unit
             }
         }
         if (allAttempts.any { it.outcome == ProbeOutcome.EMPTY_INBOX }) {

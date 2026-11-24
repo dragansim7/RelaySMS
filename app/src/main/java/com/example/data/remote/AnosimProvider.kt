@@ -60,6 +60,7 @@ class AnosimProvider(private val client: OkHttpClient) {
                     }
                 )
                 is TempFetchResult.Failure -> Result.failure(IllegalStateException(res.errorMessage))
+                TempFetchResult.SkippedInProgress -> Result.success(emptyList())
             }
         } finally {
             mutex.unlock()

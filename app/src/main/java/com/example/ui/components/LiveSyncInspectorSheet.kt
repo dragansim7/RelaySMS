@@ -470,9 +470,14 @@ private fun ProbeAttemptCard(
                 }
             }
 
-            if (attempt.parsedCount > 0 || attempt.insertedCount > 0 || attempt.dedupSkippedCount > 0) {
+            if (attempt.parsedCount > 0 || attempt.insertedCount > 0 || attempt.dedupSkippedCount > 0 || attempt.droppedByRetentionCount > 0) {
+                val retentionSuffix = if (attempt.droppedByRetentionCount > 0) {
+                    " · Older skipped: ${attempt.droppedByRetentionCount}"
+                } else {
+                    ""
+                }
                 Text(
-                    text = "Parsed: ${attempt.parsedCount} · Saved new: +${attempt.insertedCount} · Duplicates skipped: ${attempt.dedupSkippedCount}",
+                    text = "Parsed: ${attempt.parsedCount} · Saved new: +${attempt.insertedCount} · Duplicates skipped: ${attempt.dedupSkippedCount}$retentionSuffix",
                     fontFamily = JetBrainsMonoFamily,
                     style = MaterialTheme.typography.labelSmall,
                     color = extras.liveSignal,

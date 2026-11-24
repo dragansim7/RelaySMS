@@ -1,6 +1,7 @@
 package com.example
 
 import com.example.data.local.CustomSourceEntity
+import com.example.data.local.TempNumberEntity
 import com.example.data.remote.AnosimProvider
 import com.example.data.remote.BotWallDetector
 import com.example.data.remote.CustomSourceAdapter
@@ -15,13 +16,24 @@ import com.example.data.remote.ReceiveSmssMirrorAdapter
 import com.example.data.remote.ReceiveSmssProvider
 import com.example.data.remote.RenderedDomMessage
 import com.example.data.remote.Sms24HtmlAdapter
+import com.example.data.remote.TempFetchResult
 import com.example.data.remote.TempSmssAdapter
+import com.example.data.remote.TempSourceEngine
 import com.example.data.remote.convertRenderedMessages
+import com.example.data.repository.NumberCardModel
 import com.example.domain.OtpCodeExtractor
 import com.example.domain.PhoneFormatter
 import com.example.domain.RelativeTimeFormatter
 import com.example.domain.WebhookPayloadParser
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.async
+import kotlinx.coroutines.runBlocking
+import okhttp3.Interceptor
+import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
+import okhttp3.Protocol
+import okhttp3.Response
+import okhttp3.ResponseBody.Companion.toResponseBody
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotEquals
@@ -418,5 +430,175 @@ class RelayCoreUnitTest {
         assertTrue(snippet.contains("dd=1"))
         assertTrue(snippet.contains("created=1"))
         assertTrue(snippet.contains("Hello OTP"))
+    }
+
+    @Test
+    fun sms24Regressions_placeholderCollisionPlainSpanUnclosedHtml5AndDtAttrs() {
+        val sms24 = Sms24HtmlAdapter(OkHttpClient())
+        val nowMs = 1_795_507_200_000L // ~2026-11-24
+
+        // 1. Real SMS24.me Bootstrap 5 markup: <a class="placeholder ms-1"> appears BEFORE <span class="placeholder text-break">
+        //    AND body contains "valid for 7 days" (must NOT backdate the message by 7 days!)
+        val realBootstrapHtml = """
+            <dl class="row">
+              <dt class="col-3" data-created="2026-11-24 07:45:12">
+                <div class="placeholder" data-created="2026-11-24 07:45:12">12 minutes ago</div>
+              </dt>
+              <dd class="col-9">
+                <label>From: <a class="placeholder ms-1" title="1415555123" href="/en/messages/Google">Google</a></label>
+                <span class="placeholder text-break">G-842910 is your Google code, valid for 7 days.</span>
+              </dd>
+            </dl>
+        """.trimIndent()
+        val (msgs1, strat1) = sms24.parseHtmlWithStrategy(realBootstrapHtml, nowMs)
+        assertEquals("dl-dt-dd-balanced", strat1)
+        assertEquals(1, msgs1.size)
+        assertEquals("Google", msgs1.first().senderName)
+        assertEquals("G-842910 is your Google code, valid for 7 days.", msgs1.first().body)
+        assertTrue(msgs1.first().hasExplicitTimestamp)
+        // Must parse 2026-11-24 07:45:12, NOT 2014 (from title="1415555123") and NOT nowMs - 7 days
+        assertTrue(msgs1.first().receivedAtEpochMs > 1_795_000_000_000L)
+
+        // 2. Plain <span> without .placeholder class, preceded by a label <span>
+        val plainSpanHtml = """
+            <dl class="row">
+              <dt class="col-3" data-created="2026/11/24 7:05:12">15 mins ago</dt>
+              <dd class="col-9">
+                <label><span class="placeholder">From:</span> <a href="https://sms24.me/en/messages/Uber">Uber</a></label>
+                <span>Your Uber code is 519204. Never share this code.</span>
+              </dd>
+            </dl>
+        """.trimIndent()
+        val (msgs2, _) = sms24.parseHtmlWithStrategy(plainSpanHtml, nowMs)
+        assertEquals(1, msgs2.size)
+        assertEquals("Uber", msgs2.first().senderName)
+        assertEquals("Your Uber code is 519204. Never share this code.", msgs2.first().body)
+        assertTrue(msgs2.first().hasExplicitTimestamp)
+
+        // 3. HTML5 minified <dl> with omitted </dt> and </dd> closing tags
+        val unclosedHtml5 = """
+            <dl class="row">
+              <dt class="col-3" data-created="2026-11-24 08:00:00">2 mins ago
+              <dd class="col-9">
+                <label>From: <a class="placeholder ms-1" href="/en/messages/Discord">Discord</a></label>
+                <span class="placeholder text-break">Your Discord verification code is 774120</span>
+              <dt class="col-3" data-created="2026-11-24 07:50:00">12 mins ago
+              <dd class="col-9">
+                <label>From: <a class="placeholder ms-1" href="/en/messages/Signal">Signal</a></label>
+                <span class="placeholder text-break">Signal code: 331-890</span>
+            </dl>
+        """.trimIndent()
+        val (msgs3, strat3) = sms24.parseHtmlWithStrategy(unclosedHtml5, nowMs)
+        assertEquals("dd-unclosed-html5", strat3)
+        assertEquals(2, msgs3.size)
+        assertEquals("Discord", msgs3[0].senderName)
+        assertEquals("Your Discord verification code is 774120", msgs3[0].body)
+        assertEquals("Signal", msgs3[1].senderName)
+        assertEquals("Signal code: 331-890", msgs3[1].body)
+
+        // 4. Script tags containing "no messages yet" must NOT trigger genuine empty-inbox detection
+        val scriptEmptyHtml = "<html><body><script>const emptyText = 'No messages yet';</script><main><div>Loading</div></main></body></html>"
+        assertFalse(sms24.isGenuinelyEmptySms24Page(scriptEmptyHtml))
+        val visibleEmptyHtml = "<html><body><main><p>No messages yet for this number.</p></main></body></html>"
+        assertTrue(sms24.isGenuinelyEmptySms24Page(visibleEmptyHtml))
+    }
+
+    @Test
+    fun timestampHardening_rejectsPhoneNumbersAndBodyDurationsAndParsesNamedMonths() {
+        val nowMs = 1_795_507_200_000L
+
+        // 10-digit phone number in title attribute must NOT be treated as a 2014 Unix timestamp
+        val phoneTitle = FlexibleTimestampParser.extractFromHtmlOrText(
+            """<a title="1415555123" href="/en/messages/Bank">Bank</a>""",
+            nowMs,
+        )
+        assertFalse(phoneTitle.isExplicit)
+        assertEquals(nowMs, phoneTitle.epochMs)
+
+        // Duration inside SMS body without "ago" must NOT backdate message
+        val bodyDuration = FlexibleTimestampParser.parse("Your OTP 123456 expires in 7 days", nowMs)
+        assertFalse(bodyDuration.isExplicit)
+        assertEquals(nowMs, bodyDuration.epochMs)
+
+        // Named-month and slash-date formats must parse explicitly
+        val dmy = FlexibleTimestampParser.parse("24 Nov 2026 07:05", nowMs)
+        assertTrue(dmy.isExplicit)
+        val mdy = FlexibleTimestampParser.parse("Nov 24, 2026 05:05 PM", nowMs)
+        assertTrue(mdy.isExplicit)
+        val slashSingleHour = FlexibleTimestampParser.parse("2026/11/24 7:05:12", nowMs)
+        assertTrue(slashSingleHour.isExplicit)
+    }
+
+    @Test
+    fun relayPipeline_noFakeGreenOnEmptyInboxAndLockContentionSkipsCleanly() = runBlocking {
+        val nowMs = 1_795_507_200_000L
+
+        // 1. Auto temp number with STATUS_ONLINE and 0 messages (lastAtEpochMs == null) must NOT be Active (green)
+        val emptyOnlineCard = NumberCardModel(
+            id = "61400667111",
+            e164 = "+61400667111",
+            countryCode = "AU",
+            countryName = "Australia",
+            label = "SMS24 AU",
+            carrier = "SMS24.me",
+            providerType = "temp_auto",
+            dayCount = 0,
+            lastAtEpochMs = null,
+            preview = null,
+            senderName = null,
+            unseenCount = 0,
+            isTemp = true,
+            tempMode = TempNumberEntity.MODE_AUTO,
+            tempStatus = TempNumberEntity.STATUS_ONLINE,
+            tempLastSyncEpochMs = nowMs - 5_000L,
+        )
+        assertFalse(emptyOnlineCard.isActive(nowMs))
+
+        // Same card WITH a message received 20 minutes ago MUST be Active (green)
+        val activeCard = emptyOnlineCard.copy(dayCount = 1, lastAtEpochMs = nowMs - 20L * 60_000L)
+        assertTrue(activeCard.isActive(nowMs))
+
+        // 2. Concurrent non-force poll while a fetch is in flight MUST return SkippedInProgress (never fake Success(emptyList()))
+        val requestStarted = CompletableDeferred<Unit>()
+        val allowResponse = CompletableDeferred<Unit>()
+        val blockingClient = OkHttpClient.Builder()
+            .addInterceptor(Interceptor { chain ->
+                requestStarted.complete(Unit)
+                runBlocking { allowResponse.await() }
+                Response.Builder()
+                    .request(chain.request())
+                    .protocol(Protocol.HTTP_1_1)
+                    .code(200)
+                    .message("OK")
+                    .body(
+                        """<dl><dt data-created="2026-11-24 07:45:12">5 mins ago</dt><dd><label>From: <a class="placeholder ms-1" href="/en/messages/Google">Google</a></label><span class="placeholder text-break">Code 123456</span></dd></dl>"""
+                            .toResponseBody("text/html".toMediaType())
+                    )
+                    .build()
+            })
+            .build()
+
+        val engine = TempSourceEngine(blockingClient)
+        val temp = TempNumberEntity(
+            numberId = "61400667111",
+            e164 = "+61400667111",
+            mode = TempNumberEntity.MODE_AUTO,
+            sourceType = TempNumberEntity.SOURCE_SMS24_ME,
+            label = "SMS24 AU",
+        )
+
+        val firstFetch = async { engine.fetchForTempNumber(temp, customSource = null, force = true) }
+        requestStarted.await()
+        assertTrue(engine.isSyncInProgress(temp.numberId))
+
+        // Overlapping non-force poll must return SkippedInProgress, NOT Success(emptyList())
+        val overlappingResult = engine.fetchForTempNumber(temp, customSource = null, force = false)
+        assertEquals(TempFetchResult.SkippedInProgress, overlappingResult)
+
+        allowResponse.complete(Unit)
+        val finalResult = firstFetch.await()
+        assertTrue(finalResult is TempFetchResult.Success)
+        assertEquals(1, (finalResult as TempFetchResult.Success).messages.size)
+        assertEquals("Code 123456", finalResult.messages.first().body)
     }
 }

@@ -342,21 +342,30 @@ interface RelayDao {
     ): Int
 
     /**
-     * Prunes messages older than 48h while explicitly keeping history for
-     * MANUAL and PINNED temporary numbers indefinitely until user deletion.
+     * Prunes built-in feed messages older than [cutoffEpochMs] (48h) and unpinned AUTO
+     * temporary number messages older than [tempCutoffEpochMs] (30d), while keeping
+     * MANUAL and PINNED temporary number history indefinitely until user deletion.
      */
     @Query(
         """
         DELETE FROM messages
-        WHERE receivedAtEpochMs < :cutoffEpochMs
-          AND isManual = 0
-          AND numberId NOT IN (
-              SELECT numberId FROM temp_numbers
-              WHERE mode = 'MANUAL' OR isPinned = 1
+        WHERE isManual = 0
+          AND (
+              (
+                  numberId NOT IN (SELECT numberId FROM temp_numbers)
+                  AND receivedAtEpochMs < :cutoffEpochMs
+              )
+              OR (
+                  numberId IN (
+                      SELECT numberId FROM temp_numbers
+                      WHERE mode != 'MANUAL' AND isPinned = 0
+                  )
+                  AND receivedAtEpochMs < :tempCutoffEpochMs
+              )
           )
         """
     )
-    suspend fun pruneMessagesOlderThan(cutoffEpochMs: Long): Int
+    suspend fun pruneMessagesOlderThan(cutoffEpochMs: Long, tempCutoffEpochMs: Long): Int
 
     @Query("DELETE FROM numbers WHERE id IN (:ids)")
     suspend fun deleteNumbersByIds(ids: List<String>): Int

@@ -9,7 +9,8 @@ import kotlin.math.roundToLong
 object RelativeTimeFormatter {
 
     const val ACTIVE_WINDOW_MS: Long = 24L * 60L * 60L * 1000L // 24 hours
-    const val RETENTION_WINDOW_MS: Long = 48L * 60L * 60L * 1000L // 48 hours
+    const val RETENTION_WINDOW_MS: Long = 48L * 60L * 60L * 1000L // 48 hours (built-in feeds)
+    const val TEMP_RETENTION_WINDOW_MS: Long = 30L * 24L * 60L * 60L * 1000L // 30 days (auto temp lines)
     const val DAY_WINDOW_MS: Long = 24L * 60L * 60L * 1000L // 24 hours
 
     fun isLineActive(lastAtEpochMs: Long?, nowMs: Long = System.currentTimeMillis()): Boolean {

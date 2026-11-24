@@ -75,8 +75,7 @@ data class NumberCardModel(
     fun isActive(nowMs: Long = System.currentTimeMillis()): Boolean {
         val recent24h = RelativeTimeFormatter.isLineActive(lastAtEpochMs, nowMs)
         if (isTemp && tempMode == TempNumberEntity.MODE_AUTO) {
-            return (tempStatus == TempNumberEntity.STATUS_ONLINE && recent24h) ||
-                (tempStatus == TempNumberEntity.STATUS_ONLINE && lastAtEpochMs == null && tempLastSyncEpochMs != null)
+            return tempStatus == TempNumberEntity.STATUS_ONLINE && recent24h
         }
         if (isHostedBuiltIn) {
             return recent24h && !isProviderDegraded
@@ -225,11 +224,17 @@ class RelayRepository(
     }
 
     suspend fun pruneOldMessages() {
-        val cutoff = System.currentTimeMillis() - RelativeTimeFormatter.RETENTION_WINDOW_MS
-        dao.pruneMessagesOlderThan(cutoff)
+        val now = System.currentTimeMillis()
+        val cutoff = now - RelativeTimeFormatter.RETENTION_WINDOW_MS
+        val tempCutoff = now - RelativeTimeFormatter.TEMP_RETENTION_WINDOW_MS
+        dao.pruneMessagesOlderThan(cutoffEpochMs = cutoff, tempCutoffEpochMs = tempCutoff)
     }
 
-    suspend fun syncAll(force: Boolean = false, isManual: Boolean = false) {
+    suspend fun syncAll(
+        force: Boolean = false,
+        isManual: Boolean = false,
+        includeTempNumbers: Boolean = isManual || force,
+    ) {
         if (isManual) {
             _syncHealth.update { it.copy(isManualRefreshing = true) }
         }
@@ -238,10 +243,14 @@ class RelayRepository(
             coroutineScope {
                 val anosimJob = async { syncAnosimInternal(force = force) }
                 val rsJob = async { syncReceiveSmssInternal(onlyNumberId = null, force = force) }
-                val tempJob = async { syncAllAutoTempNumbers(force = force) }
+                val tempJob = if (includeTempNumbers) {
+                    async { syncAllAutoTempNumbers(force = force) }
+                } else {
+                    null
+                }
                 anosimJob.await()
                 rsJob.await()
-                tempJob.await()
+                tempJob?.await()
             }
         } finally {
             if (isManual) {
@@ -289,6 +298,10 @@ class RelayRepository(
         if (temp.mode != TempNumberEntity.MODE_AUTO) {
             return Result.success(0)
         }
+        // Avoid stomping live status/UI when another poll for this number is already running
+        if (!force && tempSourceEngine.isSyncInProgress(temp.numberId)) {
+            return Result.success(0)
+        }
 
         val startedAt = System.currentTimeMillis()
         dao.updateTempSyncState(
@@ -301,8 +314,17 @@ class RelayRepository(
 
         val customSource = temp.customSourceId?.let { dao.getCustomSourceById(it) }
         return when (val result = tempSourceEngine.fetchForTempNumber(temp, customSource, force)) {
+            TempFetchResult.SkippedInProgress -> {
+                // Another sync holds the lock; leave DB state & diagnostics untouched for the owner
+                Result.success(0)
+            }
             is TempFetchResult.Success -> {
-                val persist = persistTempMessages(temp.numberId, result.messages, keepAllHistory = temp.isPinned)
+                val persist = persistTempMessages(
+                    numberId = temp.numberId,
+                    messages = result.messages,
+                    keepAllHistory = temp.isPinned,
+                    retentionWindowMs = RelativeTimeFormatter.TEMP_RETENTION_WINDOW_MS,
+                )
                 val finishedAt = System.currentTimeMillis()
                 dao.updateTempSyncState(
                     numberId = temp.numberId,
@@ -316,10 +338,18 @@ class RelayRepository(
                     winningSource = result.resolvedSource,
                     inserted = persist.inserted,
                     dedupSkipped = persist.dedupSkipped,
+                    droppedByRetention = persist.droppedByRetention,
                 )
                 val verdict = if (result.messages.isNotEmpty()) ProbeOutcome.SUCCESS_WITH_MESSAGES else ProbeOutcome.EMPTY_INBOX
                 val summary = if (result.messages.isNotEmpty()) {
-                    "Synced ${result.messages.size} messages via ${sourceDisplayName(result.resolvedSource, customSource?.name)} (+${persist.inserted} new, ${persist.dedupSkipped} duplicate skipped)."
+                    buildString {
+                        append("Synced ${result.messages.size} messages via ${sourceDisplayName(result.resolvedSource, customSource?.name)} ")
+                        append("(+${persist.inserted} new, ${persist.dedupSkipped} duplicate skipped")
+                        if (persist.droppedByRetention > 0) {
+                            append(", ${persist.droppedByRetention} older than 30d skipped")
+                        }
+                        append(").")
+                    }
                 } else {
                     "Connected to ${sourceDisplayName(result.resolvedSource, customSource?.name)} — inbox currently has 0 messages."
                 }
@@ -408,6 +438,7 @@ class RelayRepository(
                             winningSource = result.resolvedSource,
                             inserted = persist.inserted,
                             dedupSkipped = persist.dedupSkipped,
+                            droppedByRetention = persist.droppedByRetention,
                         )
                         val verdict = if (result.messages.isNotEmpty()) ProbeOutcome.SUCCESS_WITH_MESSAGES else ProbeOutcome.EMPTY_INBOX
                         val report = TempSyncDiagnosticReport(
@@ -452,6 +483,7 @@ class RelayRepository(
                         recordDiagnosticReport(report)
                         report
                     }
+                    TempFetchResult.SkippedInProgress -> _diagnosticReports.value[cleanId]
                 }
             }
             else -> null
@@ -485,6 +517,7 @@ class RelayRepository(
         winningSource: String,
         inserted: Int,
         dedupSkipped: Int,
+        droppedByRetention: Int = 0,
     ): List<SourceProbeAttempt> {
         val winIdx = attempts.indexOfLast { it.sourceKey == winningSource && it.parsedCount > 0 }
             .takeIf { it >= 0 }
@@ -492,7 +525,11 @@ class RelayRepository(
         if (winIdx < 0) return attempts
         return attempts.mapIndexed { idx, attempt ->
             if (idx == winIdx) {
-                attempt.copy(insertedCount = inserted, dedupSkippedCount = dedupSkipped)
+                attempt.copy(
+                    insertedCount = inserted,
+                    dedupSkippedCount = dedupSkipped,
+                    droppedByRetentionCount = droppedByRetention,
+                )
             } else {
                 attempt
             }
@@ -753,18 +790,24 @@ class RelayRepository(
     private data class TempPersistStats(
         val inserted: Int,
         val dedupSkipped: Int,
+        val droppedByRetention: Int = 0,
     )
 
     private suspend fun persistTempMessages(
         numberId: String,
         messages: List<TempParsedMessage>,
         keepAllHistory: Boolean,
+        retentionWindowMs: Long = RelativeTimeFormatter.RETENTION_WINDOW_MS,
     ): TempPersistStats {
         var added = 0
         var dupSkipped = 0
-        val retentionCutoff = System.currentTimeMillis() - RelativeTimeFormatter.RETENTION_WINDOW_MS
+        var droppedByRetention = 0
+        val retentionCutoff = System.currentTimeMillis() - retentionWindowMs
         for (msg in messages) {
-            if (!keepAllHistory && msg.receivedAtEpochMs < retentionCutoff) continue
+            if (!keepAllHistory && msg.receivedAtEpochMs < retentionCutoff) {
+                droppedByRetention += 1
+                continue
+            }
             val hash = PhoneFormatter.computeDedupHash(numberId, msg.senderName, msg.body, msg.receivedAtEpochMs)
             if (dao.countByDedupHash(numberId, hash) > 0) {
                 dupSkipped += 1
@@ -811,7 +854,11 @@ class RelayRepository(
             )
             added += 1
         }
-        return TempPersistStats(inserted = added, dedupSkipped = dupSkipped)
+        return TempPersistStats(
+            inserted = added,
+            dedupSkipped = dupSkipped,
+            droppedByRetention = droppedByRetention,
+        )
     }
 
     private suspend fun syncAnosimInternal(force: Boolean) {
@@ -845,6 +892,7 @@ class RelayRepository(
                     winningSource = TempNumberEntity.SOURCE_ANOSIM,
                     inserted = persist.inserted,
                     dedupSkipped = persist.dedupSkipped,
+                    droppedByRetention = persist.droppedByRetention,
                 )
                 val verdict = if (result.messages.isNotEmpty()) ProbeOutcome.SUCCESS_WITH_MESSAGES else ProbeOutcome.EMPTY_INBOX
                 recordDiagnosticReport(
@@ -897,6 +945,7 @@ class RelayRepository(
                     )
                 )
             }
+            TempFetchResult.SkippedInProgress -> Unit
         }
     }
 

@@ -25,6 +25,7 @@ data class SourceProbeAttempt(
     val parsedCount: Int = 0,
     val insertedCount: Int = 0,
     val dedupSkippedCount: Int = 0,
+    val droppedByRetentionCount: Int = 0,
     val outcome: ProbeOutcome = ProbeOutcome.ERROR,
     val detailMessage: String = "",
     val responseSnippet: String? = null,
@@ -60,7 +61,8 @@ data class TempSyncDiagnosticReport(
             sb.appendLine("   HTTP: ${a.httpCode ?: "N/A"} | Latency: ${a.latencyMs}ms | Size: ${a.payloadBytes}B")
             if (a.parserStrategy != null) sb.appendLine("   Parser: ${a.parserStrategy}")
             if (a.botChallengeDetected) sb.appendLine("   Anti-Bot: Challenge page detected")
-            sb.appendLine("   Messages: parsed=${a.parsedCount}, inserted=${a.insertedCount}, dupSkipped=${a.dedupSkippedCount}")
+            val retentionNote = if (a.droppedByRetentionCount > 0) ", retentionSkipped=${a.droppedByRetentionCount}" else ""
+            sb.appendLine("   Messages: parsed=${a.parsedCount}, inserted=${a.insertedCount}, dupSkipped=${a.dedupSkippedCount}$retentionNote")
             if (a.detailMessage.isNotBlank()) sb.appendLine("   Detail: ${a.detailMessage}")
             if (!a.responseSnippet.isNullOrBlank()) {
                 sb.appendLine("   Snippet: ${a.responseSnippet.take(180)}")
@@ -152,14 +154,22 @@ object BotWallDetector {
 
     private val navHeaderRegex = Regex("""<(?:header|nav|footer)[^>]*>[\s\S]*?</(?:header|nav|footer)>""", RegexOption.IGNORE_CASE)
 
-    fun buildSnippet(raw: String, maxLen: Int = 420): String {
+    fun stripNonVisibleTags(html: String): String {
+        return scriptStyleRegex.replace(html, " ")
+            .replace(templateTagRegex, " ")
+    }
+
+    private val templateTagRegex = Regex("""<template[^>]*>[\s\S]*?</template>""", RegexOption.IGNORE_CASE)
+
+    fun buildSnippet(raw: String, maxLen: Int = 480): String {
         val title = extractTitle(raw)
         val trimmed = raw.trim()
         if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
             return whitespaceRegex.replace(trimmed, " ").take(maxLen).ifBlank { "(empty JSON)" }
         }
 
-        val lower = trimmed.lowercase()
+        val noScripts = stripNonVisibleTags(trimmed)
+        val lower = noScripts.lowercase()
         val ddCount = Regex("""<dd[\s>]""").findAll(lower).count()
         val createdCount = Regex("""data-created\s*=""").findAll(lower).count()
         val msgLinkCount = Regex("""/messages?/""").findAll(lower).count()
@@ -167,7 +177,6 @@ object BotWallDetector {
         val tableRowCount = Regex("""<tr[\s>]""").findAll(lower).count()
         val domTag = "[DOM dd=$ddCount created=$createdCount links=$msgLinkCount ph=$placeholderCount tr=$tableRowCount]"
 
-        val noScripts = scriptStyleRegex.replace(trimmed, " ")
         val focusedHtml = when {
             lower.contains("<main") -> noScripts.substringAfter("<main", noScripts).let { "<main$it" }
             else -> navHeaderRegex.replace(noScripts, " ")
