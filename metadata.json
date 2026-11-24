@@ -1,0 +1,8 @@
+{
+  "name": "Relay",
+  "description": "Public SMS inbox & virtual number receiver with real-time Anosim and receive-smss.live syncing, automatic OTP extraction, and circuitry amber themes.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
