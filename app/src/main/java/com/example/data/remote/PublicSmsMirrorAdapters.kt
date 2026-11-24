@@ -247,11 +247,16 @@ open class GenericHtmlSmsHostAdapter(
     protected val displayName: String,
     protected val sourceTag: String,
     private val refererRoot: String,
+    private val browserFetcher: BrowserDomFetcher? = null,
     private val urlsForNumber: (digits: String, countryTitleSlug: String, countryLowerSlug: String) -> List<String>,
 ) {
     private val cache = ConcurrentHashMap<String, MirrorCacheEntry>()
 
-    suspend fun fetch(e164: String, force: Boolean = false): TempFetchResult {
+    suspend fun fetch(
+        e164: String,
+        force: Boolean = false,
+        allowBrowserFallback: Boolean = false,
+    ): TempFetchResult {
         val digits = PhoneFormatter.digitsOnly(e164)
         val now = System.currentTimeMillis()
         val cached = cache[digits]
@@ -270,7 +275,7 @@ open class GenericHtmlSmsHostAdapter(
         val attempts = mutableListOf<SourceProbeAttempt>()
         var lastFailure: TempFetchResult.Failure? = null
 
-        return withContext(Dispatchers.IO) {
+        val httpResult = withContext(Dispatchers.IO) {
             for (url in candidateUrls) {
                 val started = System.currentTimeMillis()
                 try {
@@ -308,7 +313,7 @@ open class GenericHtmlSmsHostAdapter(
                         } else if (response.code in 200..299) {
                             val (parsed, strategy) = parseHostHtml(html)
                             val lower = html.lowercase()
-                            val explicitEmpty = lower.contains("no message") || lower.contains("no sms") || lower.contains("inbox is empty")
+                            val explicitEmpty = lower.contains("has not received") || lower.contains("no sms received") || lower.contains("inbox is empty")
                             val outcome = when {
                                 parsed.isNotEmpty() -> ProbeOutcome.SUCCESS_WITH_MESSAGES
                                 explicitEmpty || html.length < 1_500 -> ProbeOutcome.EMPTY_INBOX
@@ -400,20 +405,72 @@ open class GenericHtmlSmsHostAdapter(
                     )
                 }
             }
+            null
+        }
 
-            if (attempts.any { it.outcome == ProbeOutcome.EMPTY_INBOX }) {
-                TempFetchResult.Success(
-                    messages = emptyList(),
-                    resolvedSource = sourceKey,
-                    attempts = attempts.toList(),
-                )
-            } else {
-                lastFailure?.copy(attempts = attempts.toList()) ?: TempFetchResult.Failure(
-                    status = TempNumberEntity.STATUS_NOT_FOUND,
-                    errorMessage = "Number not found on $displayName.",
-                    attempts = attempts.toList(),
-                )
+        if (httpResult != null) return httpResult
+
+        // Optional Stage 2: Live Chromium DOM extraction when explicitly selected and static HTML matched 0 blocks or hit JS bot wall
+        if (allowBrowserFallback && browserFetcher != null && attempts.any { it.outcome == ProbeOutcome.PARSE_MISMATCH || it.outcome == ProbeOutcome.BOT_BLOCKED }) {
+            val targetUrl = candidateUrls.firstOrNull()
+            if (targetUrl != null) {
+                val rendered = browserFetcher.renderAndExtract(targetUrl, referer = refererRoot, maxWaitMs = 6_000L)
+                if (rendered != null) {
+                    val nowRender = System.currentTimeMillis()
+                    val jsMsgs = convertRenderedMessages(rendered.messages, sourceTag, displayName, nowRender)
+                    val (finalMsgs, strategy) = if (jsMsgs.isNotEmpty()) {
+                        jsMsgs to (rendered.messages.firstOrNull()?.strategy ?: "chromium-dom")
+                    } else if (rendered.outerHtml.isNotBlank()) {
+                        val (hMsgs, hStrat) = parseHostHtml(rendered.outerHtml, nowRender)
+                        hMsgs to hStrat?.let { "chromium+$it" }
+                    } else {
+                        emptyList<TempParsedMessage>() to null
+                    }
+                    val outcome = if (finalMsgs.isNotEmpty()) ProbeOutcome.SUCCESS_WITH_MESSAGES else ProbeOutcome.PARSE_MISMATCH
+                    attempts.add(
+                        SourceProbeAttempt(
+                            sourceKey = sourceKey,
+                            displayName = "$displayName (Live Chromium DOM)",
+                            url = rendered.finalUrl,
+                            httpCode = if (rendered.error == null) 200 else null,
+                            latencyMs = rendered.latencyMs,
+                            payloadBytes = rendered.outerHtml.toByteArray().size,
+                            parserStrategy = strategy,
+                            parsedCount = finalMsgs.size,
+                            outcome = outcome,
+                            detailMessage = if (finalMsgs.isNotEmpty()) {
+                                "Extracted ${finalMsgs.size} messages via $strategy (${rendered.domSummary})"
+                            } else {
+                                "Live Chromium DOM matched 0 messages (${rendered.domSummary})"
+                            },
+                            responseSnippet = "[${rendered.domSummary}] ${rendered.visibleTextSnippet}".take(420),
+                        )
+                    )
+                    if (finalMsgs.isNotEmpty()) {
+                        val success = TempFetchResult.Success(
+                            messages = finalMsgs,
+                            resolvedSource = sourceKey,
+                            attempts = attempts.toList(),
+                        )
+                        cache[digits] = MirrorCacheEntry(System.currentTimeMillis(), success)
+                        return success
+                    }
+                }
             }
+        }
+
+        return if (attempts.any { it.outcome == ProbeOutcome.EMPTY_INBOX }) {
+            TempFetchResult.Success(
+                messages = emptyList(),
+                resolvedSource = sourceKey,
+                attempts = attempts.toList(),
+            )
+        } else {
+            lastFailure?.copy(attempts = attempts.toList()) ?: TempFetchResult.Failure(
+                status = TempNumberEntity.STATUS_NOT_FOUND,
+                errorMessage = "Number not found on $displayName.",
+                attempts = attempts.toList(),
+            )
         }
     }
 
@@ -535,23 +592,31 @@ open class GenericHtmlSmsHostAdapter(
     }
 }
 
-class QuackrAdapter(client: OkHttpClient) : GenericHtmlSmsHostAdapter(
+class QuackrAdapter(
+    client: OkHttpClient,
+    browserFetcher: BrowserDomFetcher? = null,
+) : GenericHtmlSmsHostAdapter(
     client = client,
     sourceKey = TempNumberEntity.SOURCE_QUACKR,
     displayName = "Quackr.io",
     sourceTag = "quackr",
     refererRoot = "https://quackr.io/temporary-numbers/australia",
+    browserFetcher = browserFetcher,
     urlsForNumber = { digits, _, lowerSlug ->
         listOf("https://quackr.io/temporary-numbers/$lowerSlug/$digits")
     },
 )
 
-class TempSmssAdapter(client: OkHttpClient) : GenericHtmlSmsHostAdapter(
+class TempSmssAdapter(
+    client: OkHttpClient,
+    browserFetcher: BrowserDomFetcher? = null,
+) : GenericHtmlSmsHostAdapter(
     client = client,
     sourceKey = TempNumberEntity.SOURCE_TEMPSMSS,
     displayName = "TempSMSS.com",
     sourceTag = "tempsmss",
     refererRoot = "https://tempsmss.com/",
+    browserFetcher = browserFetcher,
     urlsForNumber = { digits, _, lowerSlug ->
         listOf(
             "https://tempsmss.com/receive-sms-online/$lowerSlug-phone-number-$digits/",
@@ -560,23 +625,31 @@ class TempSmssAdapter(client: OkHttpClient) : GenericHtmlSmsHostAdapter(
     },
 )
 
-class ReceiveSmsFreeAdapter(client: OkHttpClient) : GenericHtmlSmsHostAdapter(
+class ReceiveSmsFreeAdapter(
+    client: OkHttpClient,
+    browserFetcher: BrowserDomFetcher? = null,
+) : GenericHtmlSmsHostAdapter(
     client = client,
     sourceKey = TempNumberEntity.SOURCE_RECEIVE_SMS_FREE,
     displayName = "Receive-SMS-Free.cc",
     sourceTag = "receive_sms_free",
     refererRoot = "https://receive-sms-free.cc/",
+    browserFetcher = browserFetcher,
     urlsForNumber = { digits, titleSlug, _ ->
         listOf("https://receive-sms-free.cc/Free-$titleSlug-Phone-Number/$digits/")
     },
 )
 
-class ReceiveSmsOnlineAdapter(client: OkHttpClient) : GenericHtmlSmsHostAdapter(
+class ReceiveSmsOnlineAdapter(
+    client: OkHttpClient,
+    browserFetcher: BrowserDomFetcher? = null,
+) : GenericHtmlSmsHostAdapter(
     client = client,
     sourceKey = TempNumberEntity.SOURCE_RECEIVE_SMS_ONLINE,
     displayName = "Receive-SMS-Online.info",
     sourceTag = "receive_sms_online",
     refererRoot = "https://receive-sms-online.info/",
+    browserFetcher = browserFetcher,
     urlsForNumber = { digits, titleSlug, _ ->
         listOf("https://receive-sms-online.info/$digits-$titleSlug")
     },

@@ -3,6 +3,7 @@ package com.example
 import android.app.Application
 import com.example.data.local.RelayDatabase
 import com.example.data.preferences.RelayPreferences
+import com.example.data.remote.AndroidWebViewDomFetcher
 import com.example.data.remote.AnosimProvider
 import com.example.data.remote.ReceiveSmssProvider
 import com.example.data.remote.TempSourceEngine
@@ -29,7 +30,8 @@ class RelayApplication : Application() {
         val preferences = RelayPreferences(this)
         val anosimProvider = AnosimProvider(httpClient)
         val receiveSmssProvider = ReceiveSmssProvider(httpClient)
-        val tempSourceEngine = TempSourceEngine(httpClient, anosimProvider)
+        val webViewDomFetcher = AndroidWebViewDomFetcher(this)
+        val tempSourceEngine = TempSourceEngine(httpClient, anosimProvider, webViewDomFetcher)
         val tempSyncScheduler = TempSyncScheduler(this)
 
         repository = RelayRepository(

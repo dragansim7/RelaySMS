@@ -71,7 +71,7 @@ data class TempSyncDiagnosticReport(
 }
 
 object BrowserHttpHeaders {
-    private const val CHROME_MOBILE_UA =
+    internal const val CHROME_MOBILE_UA =
         "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36"
 
     fun applyHtmlHeaders(builder: Request.Builder, referer: String? = null): Request.Builder {
@@ -150,22 +150,39 @@ object BotWallDetector {
         return HtmlEntityDecoder.decodeHtml(match.groupValues[1]).take(120).ifBlank { null }
     }
 
-    fun buildSnippet(raw: String, maxLen: Int = 360): String {
+    private val navHeaderRegex = Regex("""<(?:header|nav|footer)[^>]*>[\s\S]*?</(?:header|nav|footer)>""", RegexOption.IGNORE_CASE)
+
+    fun buildSnippet(raw: String, maxLen: Int = 420): String {
         val title = extractTitle(raw)
         val trimmed = raw.trim()
-        val bodyText = if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
-            whitespaceRegex.replace(trimmed, " ")
-        } else {
-            val noScripts = scriptStyleRegex.replace(trimmed, " ")
-            val stripped = tagRegex.replace(noScripts, " ")
-            whitespaceRegex.replace(HtmlEntityDecoder.decodeHtml(stripped), " ").trim()
+        if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
+            return whitespaceRegex.replace(trimmed, " ").take(maxLen).ifBlank { "(empty JSON)" }
         }
-        val combined = if (!title.isNullOrBlank() && !bodyText.startsWith(title)) {
-            "[$title] $bodyText"
-        } else {
-            bodyText
+
+        val lower = trimmed.lowercase()
+        val ddCount = Regex("""<dd[\s>]""").findAll(lower).count()
+        val createdCount = Regex("""data-created\s*=""").findAll(lower).count()
+        val msgLinkCount = Regex("""/messages?/""").findAll(lower).count()
+        val placeholderCount = Regex("""placeholder|text-break""").findAll(lower).count()
+        val tableRowCount = Regex("""<tr[\s>]""").findAll(lower).count()
+        val domTag = "[DOM dd=$ddCount created=$createdCount links=$msgLinkCount ph=$placeholderCount tr=$tableRowCount]"
+
+        val noScripts = scriptStyleRegex.replace(trimmed, " ")
+        val focusedHtml = when {
+            lower.contains("<main") -> noScripts.substringAfter("<main", noScripts).let { "<main$it" }
+            else -> navHeaderRegex.replace(noScripts, " ")
         }
-        return combined.take(maxLen).ifBlank { "(empty response body)" }
+        val stripped = tagRegex.replace(focusedHtml, " ")
+        val bodyText = whitespaceRegex.replace(HtmlEntityDecoder.decodeHtml(stripped), " ").trim()
+        val header = buildString {
+            if (!title.isNullOrBlank()) append("[$title] ")
+            append(domTag)
+            if (bodyText.isNotBlank()) {
+                append(" ")
+                append(bodyText)
+            }
+        }
+        return header.take(maxLen).ifBlank { "(empty response body)" }
     }
 }
 

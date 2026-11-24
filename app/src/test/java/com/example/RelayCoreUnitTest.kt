@@ -13,8 +13,10 @@ import com.example.data.remote.ReceiveSmsFreeAdapter
 import com.example.data.remote.ReceiveSmsOnlineAdapter
 import com.example.data.remote.ReceiveSmssMirrorAdapter
 import com.example.data.remote.ReceiveSmssProvider
+import com.example.data.remote.RenderedDomMessage
 import com.example.data.remote.Sms24HtmlAdapter
 import com.example.data.remote.TempSmssAdapter
+import com.example.data.remote.convertRenderedMessages
 import com.example.domain.OtpCodeExtractor
 import com.example.domain.PhoneFormatter
 import com.example.domain.RelativeTimeFormatter
@@ -352,5 +354,69 @@ class RelayCoreUnitTest {
         assertEquals("html-table", rsoStrat)
         assertEquals(1, rsoMsgs.size)
         assertEquals("receive_sms_online", rsoMsgs.first().sourceTag)
+    }
+
+    @Test
+    fun sms24TwoStage_relaxedDomAnchorsUnquotedAttrsAndChromiumConversion() {
+        val sms24 = Sms24HtmlAdapter(OkHttpClient())
+        val nowMs = 1_800_000_000_000L
+
+        // 1. Non-adjacent <dt> and <dd> separated by comment/div + unquoted attributes
+        val relaxedHtml = """
+            <dl>
+              <dt><div data-created=2026-11-23T12:00:00Z>5 minutes ago</div></dt>
+              <!-- ad separator -->
+              <div class="wrapper">
+                <dd class=shadow-sm>
+                  <label>From: <a href=/en/messages/Telegram>Telegram</a></label>
+                  <span class=placeholder>Telegram login code: 551029</span>
+                </dd>
+              </div>
+            </dl>
+        """.trimIndent()
+        val (relaxedMsgs, relaxedStrat) = sms24.parseHtmlWithStrategy(relaxedHtml, nowMs)
+        assertEquals("dd-relaxed-balanced", relaxedStrat)
+        assertEquals(1, relaxedMsgs.size)
+        assertEquals("Telegram", relaxedMsgs.first().senderName)
+        assertEquals("Telegram login code: 551029", relaxedMsgs.first().body)
+        assertTrue(relaxedMsgs.first().hasExplicitTimestamp)
+
+        // 2. Layout-agnostic From: + /en/messages/ anchor without any <dl>/<dd>
+        val anchorHtml = """
+            <section class="feed">
+              <div class="item">
+                <small>2 minutes ago</small>
+                <a href="/en/messages/Google">Google</a>
+                <p>G-774102 is your Google verification code.</p>
+              </div>
+            </section>
+        """.trimIndent()
+        val (anchorMsgs, anchorStrat) = sms24.parseHtmlWithStrategy(anchorHtml, nowMs)
+        assertEquals("from-messages-anchor", anchorStrat)
+        assertEquals(1, anchorMsgs.size)
+        assertEquals("Google", anchorMsgs.first().senderName)
+        assertTrue(anchorMsgs.first().body.contains("G-774102"))
+
+        // 3. Stage 2 Chromium WebView DOM output conversion + deduplication
+        val converted = convertRenderedMessages(
+            rendered = listOf(
+                RenderedDomMessage("From: WhatsApp", "Your WhatsApp code is 312-908", "2026-11-23 12:15:00", "chromium-dl-dd"),
+                RenderedDomMessage("WhatsApp", "Your WhatsApp code is 312-908", "2026-11-23 12:15:00", "chromium-dl-dd"),
+            ),
+            sourceTag = "sms24",
+            fallbackSender = "SMS24",
+            nowMs = nowMs,
+        )
+        assertEquals(1, converted.size)
+        assertEquals("WhatsApp", converted.first().senderName)
+        assertTrue(converted.first().hasExplicitTimestamp)
+
+        // 4. DOM-fingerprinted diagnostic snippet skips <nav> and reports element counts
+        val snippet = BotWallDetector.buildSnippet(
+            "<html><head><title>SMS24</title></head><body><nav>Home Menu</nav><main><dd data-created=\"2026-11-23 10:00:00\">Hello OTP</dd></main></body></html>"
+        )
+        assertTrue(snippet.contains("dd=1"))
+        assertTrue(snippet.contains("created=1"))
+        assertTrue(snippet.contains("Hello OTP"))
     }
 }
