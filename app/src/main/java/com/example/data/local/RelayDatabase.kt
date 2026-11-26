@@ -14,7 +14,7 @@ import androidx.sqlite.db.SupportSQLiteDatabase
         TempNumberEntity::class,
         CustomSourceEntity::class,
     ],
-    version = 2,
+    version = 3,
     exportSchema = false,
 )
 abstract class RelayDatabase : RoomDatabase() {
@@ -80,6 +80,14 @@ abstract class RelayDatabase : RoomDatabase() {
             }
         }
 
+        val MIGRATION_2_3: Migration = object : Migration(2, 3) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("ALTER TABLE messages ADD COLUMN kind TEXT NOT NULL DEFAULT 'sms'")
+                db.execSQL("ALTER TABLE messages ADD COLUMN audioUrl TEXT")
+                db.execSQL("ALTER TABLE messages ADD COLUMN localAudioPath TEXT")
+            }
+        }
+
         fun getInstance(context: Context): RelayDatabase {
             return INSTANCE ?: synchronized(this) {
                 INSTANCE ?: Room.databaseBuilder(
@@ -87,7 +95,7 @@ abstract class RelayDatabase : RoomDatabase() {
                     RelayDatabase::class.java,
                     "relay_sms.db"
                 )
-                    .addMigrations(MIGRATION_1_2)
+                    .addMigrations(MIGRATION_1_2, MIGRATION_2_3)
                     .fallbackToDestructiveMigration(dropAllTables = true)
                     .build()
                     .also { INSTANCE = it }

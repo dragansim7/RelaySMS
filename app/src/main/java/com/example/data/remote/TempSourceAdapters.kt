@@ -21,6 +21,9 @@ import java.util.Calendar
 import java.util.TimeZone
 import java.util.concurrent.ConcurrentHashMap
 
+import java.security.MessageDigest
+import kotlin.random.Random
+
 data class TempParsedMessage(
     val fromNumber: String,
     val senderName: String,
@@ -30,6 +33,9 @@ data class TempParsedMessage(
     val receivedAtEpochMs: Long,
     val hasExplicitTimestamp: Boolean = true,
     val sourceTag: String,
+    val messageKind: String = "sms",
+    val audioUrl: String? = null,
+    val overrideDedupHash: String? = null,
 )
 
 sealed class TempFetchResult {
@@ -533,376 +539,438 @@ class GetVirtualPhoneApiAdapter(private val client: OkHttpClient) {
 }
 
 /**
- * Two-stage hardened scraper for SMS24.me (https://sms24.me/en/numbers/{digits}):
- * - Stage 1 (Fast OkHttp): 6 cascading HTML extraction strategies covering <dl>/<dt>/<dd>,
- *   relaxed <dd> lookback, universal `From:` + `/messages/` link anchors, `data-created` blocks,
- *   Bootstrap callout/card/shadow/list-group containers (quoted & unquoted classes), embedded JSON,
- *   and HTML tables.
- * - Stage 2 (Live Chromium WebView DOM): Automatically executes real page JavaScript whenever
- *   Stage 1 returns 0 messages on a live page or encounters a JS anti-bot challenge, defeating
- *   AJAX/fetch hydration, Base64/JS obfuscation, and DOM layout changes.
+ * Verified SMS24.me ingestion adapter (from production JS bundles `app-B4plS_UK.js` & `turnstile-Cr7KcrXV.js`):
+ * - Transport: single-leg `in_page` (`TOKEN_TRANSPORT = "in_page"`), minting a fresh single-use
+ *   Cloudflare Turnstile token (`action: "messages"`, sitekey from `meta[name="turnstile-site-key"]`)
+ *   and immediately executing `POST https://sms24.me/api/messages/{digits}` with body
+ *   `{"page": 1, "locale": "en"}` and header `X-Turnstile-Token` inside a persistent per-number
+ *   Android Chromium WebView context.
+ * - Never makes plain HTTP `GET /en/numbers/{digits}` HTML scrapes (the page HTML is lazy-loaded)
+ *   and never sends `GET /api/messages/{digits}` (which returns Symfony 405).
+ * - Dedupe: SHA-1(`from|created|kind|content`) since no `id` field exists.
+ * - Call messages (`kind == "call"`): kept as audio URL metadata for download/playback, never printed as text.
+ * - Failure matrix: 403/422 reloads once and retries within the same cycle; 429 backs off 120s; 5xx backs off 60s.
+ * - Scheduling: jittered 90–180s cache window per number for automatic polls.
  */
 class Sms24HtmlAdapter(
-    private val client: OkHttpClient,
+    @Suppress("UNUSED_PARAMETER") private val client: OkHttpClient,
     private val browserFetcher: BrowserDomFetcher? = null,
 ) {
 
-    private val cache = ConcurrentHashMap<String, CacheEntry>()
+    private data class JitterCacheEntry(
+        val fetchedAtMs: Long,
+        val nextAllowedAtMs: Long,
+        val result: TempFetchResult.Success,
+    )
+
+    private data class BackoffState(
+        val untilMs: Long,
+        val httpCode: Int,
+    )
+
+    internal data class ParsedApiPage(
+        val messages: List<TempParsedMessage>,
+        val page: Int,
+        val pages: Int,
+        val validJson: Boolean,
+    )
+
+    private val json = Json { ignoreUnknownKeys = true; isLenient = true }
+    private val cache = ConcurrentHashMap<String, JitterCacheEntry>()
+    private val backoffUntil = ConcurrentHashMap<String, BackoffState>()
 
     suspend fun fetch(e164: String, force: Boolean = false): TempFetchResult {
         val digits = PhoneFormatter.digitsOnly(e164)
-        val url = "https://sms24.me/en/numbers/$digits"
+        val apiUrl = "https://sms24.me/api/messages/$digits"
         val now = System.currentTimeMillis()
+
+        // Enforce failure-matrix backoff (429 -> 120s, 5xx -> 60s)
+        val activeBackoff = backoffUntil[digits]
+        if (activeBackoff != null && now < activeBackoff.untilMs) {
+            if (activeBackoff.httpCode == 429 || !force) {
+                val remainingMs = (activeBackoff.untilMs - now).coerceAtLeast(1_000L)
+                val remainingSec = (remainingMs / 1_000L).coerceAtLeast(1L)
+                val is429 = activeBackoff.httpCode == 429
+                val attempt = SourceProbeAttempt(
+                    sourceKey = TempNumberEntity.SOURCE_SMS24_ME,
+                    displayName = "SMS24.me (POST API · $TOKEN_TRANSPORT)",
+                    url = apiUrl,
+                    httpCode = activeBackoff.httpCode,
+                    outcome = if (is429) ProbeOutcome.RATE_LIMITED else ProbeOutcome.ERROR,
+                    detailMessage = "Backoff active after HTTP ${activeBackoff.httpCode} (${remainingSec}s remaining)",
+                )
+                return TempFetchResult.Failure(
+                    status = if (is429) TempNumberEntity.STATUS_RATE_LIMITED else TempNumberEntity.STATUS_ERROR,
+                    errorMessage = if (is429) {
+                        "SMS24.me throttled (HTTP 429). Backing off for ${remainingSec}s."
+                    } else {
+                        "SMS24.me upstream error (HTTP ${activeBackoff.httpCode}). Retrying in ${remainingSec}s."
+                    },
+                    retryAfterMs = remainingMs,
+                    attempts = listOf(attempt),
+                )
+            }
+        }
+
+        // Jittered 90–180s per-number polling window for automatic background/foreground polls
         val cached = cache[digits]
-        if (!force && cached != null && (now - cached.fetchedAtMs) < CACHE_TTL_MS) {
+        if (!force && cached != null && now < cached.nextAllowedAtMs) {
             return cached.result.copy(
                 fromCache = true,
                 attempts = cached.result.attempts.map { it.copy(fromCache = true) },
             )
         }
 
-        val started = System.currentTimeMillis()
+        if (browserFetcher == null) {
+            val attempt = SourceProbeAttempt(
+                sourceKey = TempNumberEntity.SOURCE_SMS24_ME,
+                displayName = "SMS24.me (POST API · $TOKEN_TRANSPORT)",
+                url = apiUrl,
+                outcome = ProbeOutcome.ERROR,
+                detailMessage = "Chromium WebView required to mint Turnstile token for POST /api/messages/$digits",
+            )
+            return TempFetchResult.Failure(
+                status = TempNumberEntity.STATUS_ERROR,
+                errorMessage = "SMS24.me requires Chromium WebView to mint a Turnstile token and call POST /api/messages/$digits.",
+                attempts = listOf(attempt),
+            )
+        }
+
         val attempts = mutableListOf<SourceProbeAttempt>()
-        var shouldTryBrowserFallback = false
-        var stage1BotReason: String? = null
-        var stage1WasExplicitEmpty = false
-        var stage1HttpCode: Int? = null
+        // Up to 2 attempts within one cycle: initial in-page call + 1 reload-and-retry on 403/422 or transient WebView error
+        for (attemptIdx in 0..1) {
+            val forceReload = attemptIdx > 0
+            val resp = browserFetcher.fetchSms24ApiInPage(
+                digits = digits,
+                page = 1,
+                forceReload = forceReload,
+                maxWaitMs = 45_000L,
+            )
 
-        val stage1DirectReturn: TempFetchResult? = withContext(Dispatchers.IO) {
-            try {
-                val request = BrowserHttpHeaders.applyHtmlHeaders(
-                    Request.Builder().url(url).get(),
-                    referer = "https://sms24.me/en/numbers",
-                ).build()
+            if (resp == null) {
+                val attempt = SourceProbeAttempt(
+                    sourceKey = TempNumberEntity.SOURCE_SMS24_ME,
+                    displayName = "SMS24.me (POST API · $TOKEN_TRANSPORT)",
+                    url = apiUrl,
+                    outcome = ProbeOutcome.ERROR,
+                    detailMessage = "In-page API bridge unavailable",
+                )
+                attempts.add(attempt)
+                return TempFetchResult.Failure(
+                    status = TempNumberEntity.STATUS_ERROR,
+                    errorMessage = "SMS24.me in-page WebView bridge returned no response.",
+                    attempts = attempts.toList(),
+                )
+            }
 
-                client.newCall(request).execute().use { response ->
-                    stage1HttpCode = response.code
-                    val finalUrl = response.request.url.toString()
-                    val latency = (System.currentTimeMillis() - started).coerceAtLeast(1L)
-                    val html = response.body?.string().orEmpty()
-                    val snippet = BotWallDetector.buildSnippet(html)
-                    val botCheck = BotWallDetector.detect(response.code, html)
+            val snippet = resp.body.take(420).ifBlank { resp.error?.take(420) }
+            val payloadBytes = resp.body.toByteArray().size
+            val phaseLabel = if (forceReload) "reload-retry" else if (resp.pageReloaded) "fresh-load" else "warm-session"
 
-                    if (botCheck.isBlocked) {
-                        stage1BotReason = botCheck.reason ?: "HTTP ${response.code}"
-                        shouldTryBrowserFallback = browserFetcher != null
+            when {
+                resp.status in 200..299 -> {
+                    val parsedPage = parseApiJsonResponse(resp.body, System.currentTimeMillis())
+                    if (!parsedPage.validJson) {
+                        val botCheck = BotWallDetector.detect(resp.status, resp.body)
                         attempts.add(
                             SourceProbeAttempt(
                                 sourceKey = TempNumberEntity.SOURCE_SMS24_ME,
-                                displayName = "SMS24.me (HTTP)",
-                                url = finalUrl,
-                                httpCode = response.code,
-                                latencyMs = latency,
-                                payloadBytes = html.toByteArray().size,
-                                botChallengeDetected = true,
-                                outcome = ProbeOutcome.BOT_BLOCKED,
-                                detailMessage = botCheck.reason ?: "Anti-bot challenge detected",
+                                displayName = "SMS24.me (POST API · $TOKEN_TRANSPORT)",
+                                url = apiUrl,
+                                httpCode = resp.status,
+                                latencyMs = resp.latencyMs,
+                                payloadBytes = payloadBytes,
+                                botChallengeDetected = botCheck.isBlocked,
+                                parserStrategy = "sms24-post-json-v1",
+                                outcome = if (botCheck.isBlocked) ProbeOutcome.BOT_BLOCKED else ProbeOutcome.PARSE_MISMATCH,
+                                detailMessage = "POST /api/messages/$digits ($phaseLabel) returned non-JSON payload${if (attemptIdx == 0) " — reloading once" else ""}",
                                 responseSnippet = snippet,
                             )
                         )
-                        return@withContext null
+                        if (attemptIdx == 0) continue
+                        return TempFetchResult.Failure(
+                            status = if (botCheck.isBlocked) TempNumberEntity.STATUS_BOT_BLOCKED else TempNumberEntity.STATUS_ERROR,
+                            errorMessage = "SMS24.me POST /api/messages/$digits did not return valid JSON.",
+                            attempts = attempts.toList(),
+                        )
                     }
 
-                    when (response.code) {
-                        in 200..299 -> {
-                            // If SMS24 redirected away from the number page (e.g. to /en/numbers or /en/countries/),
-                            // this number is no longer listed — never misreport it as an empty inbox.
-                            if (!finalUrl.contains(digits)) {
-                                attempts.add(
-                                    SourceProbeAttempt(
-                                        sourceKey = TempNumberEntity.SOURCE_SMS24_ME,
-                                        displayName = "SMS24.me",
-                                        url = finalUrl,
-                                        httpCode = response.code,
-                                        latencyMs = latency,
-                                        payloadBytes = html.toByteArray().size,
-                                        outcome = ProbeOutcome.NOT_FOUND,
-                                        detailMessage = "SMS24.me redirected away from +$digits to $finalUrl",
-                                        responseSnippet = snippet,
-                                    )
-                                )
-                                return@withContext TempFetchResult.Failure(
-                                    status = TempNumberEntity.STATUS_NOT_FOUND,
-                                    errorMessage = "Number +$digits is no longer active on SMS24.me (redirected to $finalUrl).",
-                                    attempts = attempts.toList(),
-                                )
-                            }
-
-                            val (parsed, strategy) = parseHtmlWithStrategy(html)
-                            val explicitEmpty = isGenuinelyEmptySms24Page(html)
-                            stage1WasExplicitEmpty = explicitEmpty
-                            if (parsed.isNotEmpty()) {
-                                val attempt = SourceProbeAttempt(
-                                    sourceKey = TempNumberEntity.SOURCE_SMS24_ME,
-                                    displayName = "SMS24.me",
-                                    url = finalUrl,
-                                    httpCode = response.code,
-                                    latencyMs = latency,
-                                    payloadBytes = html.toByteArray().size,
-                                    parserStrategy = strategy,
-                                    parsedCount = parsed.size,
-                                    outcome = ProbeOutcome.SUCCESS_WITH_MESSAGES,
-                                    detailMessage = "Parsed ${parsed.size} messages via $strategy",
-                                    responseSnippet = snippet,
-                                )
-                                attempts.add(attempt)
-                                val result = TempFetchResult.Success(
-                                    messages = parsed,
-                                    resolvedSource = TempNumberEntity.SOURCE_SMS24_ME,
-                                    attempts = attempts.toList(),
-                                )
-                                cache[digits] = CacheEntry(System.currentTimeMillis(), result)
-                                return@withContext result
-                            }
-
-                            // 0 static messages on HTTP 200: invoke Live Chromium DOM fallback whenever available
-                            shouldTryBrowserFallback = browserFetcher != null && html.length >= 400
-                            val outcome = if (explicitEmpty && !shouldTryBrowserFallback) {
-                                ProbeOutcome.EMPTY_INBOX
+                    val outcome = if (parsedPage.messages.isNotEmpty()) {
+                        ProbeOutcome.SUCCESS_WITH_MESSAGES
+                    } else {
+                        ProbeOutcome.EMPTY_INBOX
+                    }
+                    attempts.add(
+                        SourceProbeAttempt(
+                            sourceKey = TempNumberEntity.SOURCE_SMS24_ME,
+                            displayName = "SMS24.me (POST API · $TOKEN_TRANSPORT)",
+                            url = apiUrl,
+                            httpCode = resp.status,
+                            latencyMs = resp.latencyMs,
+                            payloadBytes = payloadBytes,
+                            parserStrategy = "sms24-post-json-v1",
+                            parsedCount = parsedPage.messages.size,
+                            outcome = outcome,
+                            detailMessage = if (parsedPage.messages.isNotEmpty()) {
+                                "POST /api/messages/$digits ($phaseLabel, Turnstile OK) returned ${parsedPage.messages.size} items (page ${parsedPage.page}/${parsedPage.pages})"
                             } else {
-                                ProbeOutcome.PARSE_MISMATCH
-                            }
-                            attempts.add(
-                                SourceProbeAttempt(
-                                    sourceKey = TempNumberEntity.SOURCE_SMS24_ME,
-                                    displayName = if (shouldTryBrowserFallback) "SMS24.me (HTTP)" else "SMS24.me",
-                                    url = finalUrl,
-                                    httpCode = response.code,
-                                    latencyMs = latency,
-                                    payloadBytes = html.toByteArray().size,
-                                    parserStrategy = strategy,
-                                    parsedCount = 0,
-                                    outcome = outcome,
-                                    detailMessage = if (shouldTryBrowserFallback) {
-                                        "Static HTML (${html.length} chars) had 0 matched SMS — escalating to Live Chromium DOM"
-                                    } else if (outcome == ProbeOutcome.EMPTY_INBOX) {
-                                        "SMS24.me page loaded cleanly with an empty inbox"
-                                    } else {
-                                        "SMS24.me returned ${html.length} chars of HTML but 0 SMS blocks matched"
-                                    },
-                                    responseSnippet = snippet,
-                                )
-                            )
-                            return@withContext null
-                        }
-                        404 -> {
-                            attempts.add(
-                                SourceProbeAttempt(
-                                    sourceKey = TempNumberEntity.SOURCE_SMS24_ME,
-                                    displayName = "SMS24.me",
-                                    url = finalUrl,
-                                    httpCode = 404,
-                                    latencyMs = latency,
-                                    payloadBytes = html.toByteArray().size,
-                                    outcome = ProbeOutcome.NOT_FOUND,
-                                    detailMessage = "Number not listed on SMS24.me (HTTP 404)",
-                                    responseSnippet = snippet,
-                                )
-                            )
-                            return@withContext TempFetchResult.Failure(
-                                status = TempNumberEntity.STATUS_NOT_FOUND,
-                                errorMessage = "Number not listed on SMS24.me (HTTP 404).",
-                                attempts = attempts.toList(),
-                            )
-                        }
-                        429 -> {
-                            attempts.add(
-                                SourceProbeAttempt(
-                                    sourceKey = TempNumberEntity.SOURCE_SMS24_ME,
-                                    displayName = "SMS24.me",
-                                    url = finalUrl,
-                                    httpCode = 429,
-                                    latencyMs = latency,
-                                    outcome = ProbeOutcome.RATE_LIMITED,
-                                    detailMessage = "SMS24.me rate limited (HTTP 429)",
-                                    responseSnippet = snippet,
-                                )
-                            )
-                            return@withContext TempFetchResult.Failure(
-                                status = TempNumberEntity.STATUS_RATE_LIMITED,
-                                errorMessage = "SMS24.me rate limited this request (HTTP 429).",
-                                retryAfterMs = 30_000L,
-                                attempts = attempts.toList(),
-                            )
-                        }
-                        else -> {
-                            attempts.add(
-                                SourceProbeAttempt(
-                                    sourceKey = TempNumberEntity.SOURCE_SMS24_ME,
-                                    displayName = "SMS24.me",
-                                    url = finalUrl,
-                                    httpCode = response.code,
-                                    latencyMs = latency,
-                                    payloadBytes = html.toByteArray().size,
-                                    outcome = ProbeOutcome.ERROR,
-                                    detailMessage = "SMS24.me returned HTTP ${response.code}",
-                                    responseSnippet = snippet,
-                                )
-                            )
-                            return@withContext TempFetchResult.Failure(
-                                status = TempNumberEntity.STATUS_ERROR,
-                                errorMessage = "SMS24.me returned HTTP ${response.code}. Keeping cached messages.",
-                                attempts = attempts.toList(),
-                            )
-                        }
-                    }
-                }
-            } catch (io: IOException) {
-                val latency = (System.currentTimeMillis() - started).coerceAtLeast(1L)
-                attempts.add(
-                    SourceProbeAttempt(
-                        sourceKey = TempNumberEntity.SOURCE_SMS24_ME,
-                        displayName = "SMS24.me",
-                        url = url,
-                        latencyMs = latency,
-                        outcome = ProbeOutcome.OFFLINE,
-                        detailMessage = "Network unreachable (${io.javaClass.simpleName})",
+                                "POST /api/messages/$digits ($phaseLabel, Turnstile OK) confirmed empty inbox ({\"messages\":[]})"
+                            },
+                            responseSnippet = snippet,
+                        )
                     )
-                )
-                return@withContext TempFetchResult.Failure(
-                    status = TempNumberEntity.STATUS_OFFLINE,
-                    errorMessage = "Could not reach SMS24.me (${io.javaClass.simpleName}).",
-                    attempts = attempts.toList(),
-                )
-            } catch (t: Throwable) {
-                val latency = (System.currentTimeMillis() - started).coerceAtLeast(1L)
-                attempts.add(
-                    SourceProbeAttempt(
-                        sourceKey = TempNumberEntity.SOURCE_SMS24_ME,
-                        displayName = "SMS24.me",
-                        url = url,
-                        latencyMs = latency,
-                        outcome = ProbeOutcome.ERROR,
-                        detailMessage = t.message ?: "Failed to parse SMS24.me page",
-                    )
-                )
-                return@withContext TempFetchResult.Failure(
-                    status = TempNumberEntity.STATUS_ERROR,
-                    errorMessage = t.message ?: "Failed to parse SMS24.me page.",
-                    attempts = attempts.toList(),
-                )
-            }
-        }
-
-        if (stage1DirectReturn != null) return stage1DirectReturn
-
-        // Stage 2: Live Chromium WebView DOM rendering (handles JS hydration, AJAX, atob, Cloudflare JS)
-        if (shouldTryBrowserFallback && browserFetcher != null) {
-            val rendered = browserFetcher.renderAndExtract(
-                url = url,
-                referer = "https://sms24.me/en/numbers",
-                maxWaitMs = 7_500L,
-            )
-            if (rendered != null) {
-                val nowRender = System.currentTimeMillis()
-                val jsParsed = convertRenderedMessages(rendered.messages, "sms24", "SMS24", nowRender)
-                val (finalMsgs, strategyLabel) = if (jsParsed.isNotEmpty()) {
-                    jsParsed to (rendered.messages.firstOrNull()?.strategy ?: "chromium-dom")
-                } else if (rendered.outerHtml.isNotBlank()) {
-                    val (htmlParsed, htmlStrat) = parseHtmlWithStrategy(rendered.outerHtml, nowRender)
-                    htmlParsed to (htmlStrat?.let { "chromium+$it" })
-                } else {
-                    emptyList<TempParsedMessage>() to null
-                }
-
-                val redirectedAway = rendered.finalUrl.isNotBlank() &&
-                    !rendered.finalUrl.contains(digits) &&
-                    rendered.finalUrl != "about:blank"
-                val renderedBot = BotWallDetector.detect(rendered.httpCode ?: 200, rendered.outerHtml)
-                val renderedEmpty = rendered.error == null &&
-                    !redirectedAway &&
-                    !renderedBot.isBlocked &&
-                    (isGenuinelyEmptySms24Page(rendered.outerHtml) || isGenuinelyEmptySms24Page(rendered.visibleTextSnippet))
-                val snippetText = buildString {
-                    if (rendered.title.isNotBlank()) append("[${rendered.title}] ")
-                    if (rendered.domSummary.isNotBlank()) append("[${rendered.domSummary}] ")
-                    append(rendered.visibleTextSnippet)
-                }.take(480)
-
-                val domOutcome = when {
-                    finalMsgs.isNotEmpty() -> ProbeOutcome.SUCCESS_WITH_MESSAGES
-                    redirectedAway -> ProbeOutcome.NOT_FOUND
-                    rendered.error != null -> ProbeOutcome.ERROR
-                    renderedBot.isBlocked -> ProbeOutcome.BOT_BLOCKED
-                    renderedEmpty -> ProbeOutcome.EMPTY_INBOX
-                    else -> ProbeOutcome.PARSE_MISMATCH
-                }
-
-                attempts.add(
-                    SourceProbeAttempt(
-                        sourceKey = TempNumberEntity.SOURCE_SMS24_ME,
-                        displayName = "SMS24.me (Live Chromium DOM)",
-                        url = rendered.finalUrl,
-                        httpCode = if (rendered.error == null) (rendered.httpCode ?: 200) else stage1HttpCode,
-                        latencyMs = rendered.latencyMs,
-                        payloadBytes = rendered.outerHtml.toByteArray().size,
-                        botChallengeDetected = renderedBot.isBlocked,
-                        parserStrategy = strategyLabel,
-                        parsedCount = finalMsgs.size,
-                        outcome = domOutcome,
-                        detailMessage = when (domOutcome) {
-                            ProbeOutcome.SUCCESS_WITH_MESSAGES -> "Extracted ${finalMsgs.size} live messages via $strategyLabel (${rendered.domSummary})"
-                            ProbeOutcome.NOT_FOUND -> "Chromium redirected away from +$digits to ${rendered.finalUrl}"
-                            ProbeOutcome.EMPTY_INBOX -> "Live rendered page confirmed empty inbox (${rendered.domSummary})"
-                            ProbeOutcome.BOT_BLOCKED -> renderedBot.reason ?: "Cloudflare/anti-bot wall persisted in Chromium"
-                            ProbeOutcome.ERROR -> rendered.error ?: "Chromium DOM load failed"
-                            else -> "Rendered DOM had 0 matched SMS (${rendered.domSummary})"
-                        },
-                        responseSnippet = snippetText.ifBlank { null },
-                    )
-                )
-
-                if (finalMsgs.isNotEmpty()) {
                     val success = TempFetchResult.Success(
-                        messages = finalMsgs,
+                        messages = parsedPage.messages,
                         resolvedSource = TempNumberEntity.SOURCE_SMS24_ME,
                         attempts = attempts.toList(),
                     )
-                    cache[digits] = CacheEntry(System.currentTimeMillis(), success)
+                    val doneAt = System.currentTimeMillis()
+                    val jitterMs = Random.nextLong(MIN_JITTER_POLL_MS, MAX_JITTER_POLL_MS + 1L)
+                    backoffUntil.remove(digits)
+                    cache[digits] = JitterCacheEntry(
+                        fetchedAtMs = doneAt,
+                        nextAllowedAtMs = doneAt + jitterMs,
+                        result = success,
+                    )
                     return success
                 }
-                if (domOutcome == ProbeOutcome.NOT_FOUND) {
-                    return TempFetchResult.Failure(
-                        status = TempNumberEntity.STATUS_NOT_FOUND,
-                        errorMessage = "SMS24.me redirected away from +$digits to ${rendered.finalUrl}.",
-                        attempts = attempts.toList(),
+
+                resp.status == 403 || resp.status == 422 -> {
+                    attempts.add(
+                        SourceProbeAttempt(
+                            sourceKey = TempNumberEntity.SOURCE_SMS24_ME,
+                            displayName = "SMS24.me (POST API · $TOKEN_TRANSPORT)",
+                            url = apiUrl,
+                            httpCode = resp.status,
+                            latencyMs = resp.latencyMs,
+                            payloadBytes = payloadBytes,
+                            botChallengeDetected = true,
+                            parserStrategy = "sms24-post-json-v1",
+                            outcome = ProbeOutcome.BOT_BLOCKED,
+                            detailMessage = "HTTP ${resp.status} ($phaseLabel) — Turnstile token or challenge rejected${if (attemptIdx == 0) "; reloading page to mint fresh token" else ""}",
+                            responseSnippet = snippet,
+                        )
                     )
-                }
-                if (domOutcome == ProbeOutcome.EMPTY_INBOX) {
-                    return TempFetchResult.Success(
-                        messages = emptyList(),
-                        resolvedSource = TempNumberEntity.SOURCE_SMS24_ME,
-                        attempts = attempts.toList(),
-                    )
-                }
-                if (domOutcome == ProbeOutcome.BOT_BLOCKED) {
+                    if (attemptIdx == 0) continue
                     return TempFetchResult.Failure(
                         status = TempNumberEntity.STATUS_BOT_BLOCKED,
-                        errorMessage = "SMS24.me blocked by ${renderedBot.reason ?: "anti-bot verification"}.",
+                        errorMessage = "SMS24.me rejected Turnstile token after reload (HTTP ${resp.status}).",
+                        attempts = attempts.toList(),
+                    )
+                }
+
+                resp.status == 404 -> {
+                    attempts.add(
+                        SourceProbeAttempt(
+                            sourceKey = TempNumberEntity.SOURCE_SMS24_ME,
+                            displayName = "SMS24.me (POST API · $TOKEN_TRANSPORT)",
+                            url = resp.finalUrl.ifBlank { apiUrl },
+                            httpCode = 404,
+                            latencyMs = resp.latencyMs,
+                            payloadBytes = payloadBytes,
+                            outcome = ProbeOutcome.NOT_FOUND,
+                            detailMessage = resp.error ?: "Number +$digits not hosted on SMS24.me (HTTP 404)",
+                            responseSnippet = snippet,
+                        )
+                    )
+                    return TempFetchResult.Failure(
+                        status = TempNumberEntity.STATUS_NOT_FOUND,
+                        errorMessage = resp.error ?: "Number +$digits is not listed on SMS24.me (HTTP 404).",
+                        attempts = attempts.toList(),
+                    )
+                }
+
+                resp.status == 405 -> {
+                    attempts.add(
+                        SourceProbeAttempt(
+                            sourceKey = TempNumberEntity.SOURCE_SMS24_ME,
+                            displayName = "SMS24.me (POST API · $TOKEN_TRANSPORT)",
+                            url = apiUrl,
+                            httpCode = 405,
+                            latencyMs = resp.latencyMs,
+                            payloadBytes = payloadBytes,
+                            outcome = ProbeOutcome.ERROR,
+                            detailMessage = "HTTP 405 Method Not Allowed — endpoint requires POST /api/messages/$digits",
+                            responseSnippet = snippet,
+                        )
+                    )
+                    return TempFetchResult.Failure(
+                        status = TempNumberEntity.STATUS_ERROR,
+                        errorMessage = "SMS24.me returned HTTP 405 Method Not Allowed (POST required).",
+                        attempts = attempts.toList(),
+                    )
+                }
+
+                resp.status == 429 -> {
+                    backoffUntil[digits] = BackoffState(System.currentTimeMillis() + BACKOFF_429_MS, 429)
+                    attempts.add(
+                        SourceProbeAttempt(
+                            sourceKey = TempNumberEntity.SOURCE_SMS24_ME,
+                            displayName = "SMS24.me (POST API · $TOKEN_TRANSPORT)",
+                            url = apiUrl,
+                            httpCode = 429,
+                            latencyMs = resp.latencyMs,
+                            payloadBytes = payloadBytes,
+                            outcome = ProbeOutcome.RATE_LIMITED,
+                            detailMessage = "SMS24.me throttled (HTTP 429) — backing off 120s",
+                            responseSnippet = snippet,
+                        )
+                    )
+                    return TempFetchResult.Failure(
+                        status = TempNumberEntity.STATUS_RATE_LIMITED,
+                        errorMessage = "SMS24.me rate limited (HTTP 429). Backing off for 120s.",
+                        retryAfterMs = BACKOFF_429_MS,
+                        attempts = attempts.toList(),
+                    )
+                }
+
+                resp.status in 500..599 -> {
+                    backoffUntil[digits] = BackoffState(System.currentTimeMillis() + BACKOFF_5XX_MS, resp.status)
+                    attempts.add(
+                        SourceProbeAttempt(
+                            sourceKey = TempNumberEntity.SOURCE_SMS24_ME,
+                            displayName = "SMS24.me (POST API · $TOKEN_TRANSPORT)",
+                            url = apiUrl,
+                            httpCode = resp.status,
+                            latencyMs = resp.latencyMs,
+                            payloadBytes = payloadBytes,
+                            outcome = ProbeOutcome.ERROR,
+                            detailMessage = "SMS24.me upstream fault (HTTP ${resp.status}) — backing off 60s",
+                            responseSnippet = snippet,
+                        )
+                    )
+                    return TempFetchResult.Failure(
+                        status = TempNumberEntity.STATUS_ERROR,
+                        errorMessage = "SMS24.me upstream error (HTTP ${resp.status}). Backing off for 60s.",
+                        retryAfterMs = BACKOFF_5XX_MS,
+                        attempts = attempts.toList(),
+                    )
+                }
+
+                else -> {
+                    val isTurnstileIssue = resp.error?.contains("turnstile", ignoreCase = true) == true
+                    attempts.add(
+                        SourceProbeAttempt(
+                            sourceKey = TempNumberEntity.SOURCE_SMS24_ME,
+                            displayName = "SMS24.me (POST API · $TOKEN_TRANSPORT)",
+                            url = apiUrl,
+                            httpCode = resp.status.takeIf { it > 0 },
+                            latencyMs = resp.latencyMs,
+                            payloadBytes = payloadBytes,
+                            botChallengeDetected = isTurnstileIssue,
+                            outcome = if (isTurnstileIssue) ProbeOutcome.BOT_BLOCKED else ProbeOutcome.ERROR,
+                            detailMessage = (resp.error ?: "Unexpected status ${resp.status}") +
+                                if (attemptIdx == 0) " ($phaseLabel) — reloading once" else " ($phaseLabel)",
+                            responseSnippet = snippet,
+                        )
+                    )
+                    if (attemptIdx == 0) continue
+                    return TempFetchResult.Failure(
+                        status = if (isTurnstileIssue) TempNumberEntity.STATUS_BOT_BLOCKED else TempNumberEntity.STATUS_ERROR,
+                        errorMessage = resp.error ?: "SMS24.me API request failed (status ${resp.status}).",
                         attempts = attempts.toList(),
                     )
                 }
             }
         }
 
-        // Fall back to Stage 1 outcome when Stage 2 wasn't available or didn't find messages
-        return when {
-            stage1BotReason != null -> TempFetchResult.Failure(
-                status = TempNumberEntity.STATUS_BOT_BLOCKED,
-                errorMessage = "SMS24.me blocked by $stage1BotReason.",
-                attempts = attempts.toList(),
-            )
-            stage1WasExplicitEmpty -> TempFetchResult.Success(
-                messages = emptyList(),
-                resolvedSource = TempNumberEntity.SOURCE_SMS24_ME,
-                attempts = attempts.toList(),
-            )
-            else -> TempFetchResult.Failure(
-                status = TempNumberEntity.STATUS_ERROR,
-                errorMessage = "SMS24.me loaded (HTTP ${stage1HttpCode ?: 200}) but matched 0 SMS blocks. Tap Inspect → Show response preview.",
-                attempts = attempts.toList(),
-            )
+        return TempFetchResult.Failure(
+            status = TempNumberEntity.STATUS_ERROR,
+            errorMessage = "SMS24.me POST /api/messages/$digits failed after reload.",
+            attempts = attempts.toList(),
+        )
+    }
+
+    /**
+     * Parses the verified `POST /api/messages/{number}` JSON contract:
+     * `{"messages": [{"from": "...", "senderUrl": null, "created": "...", "content": "...", "kind": "sms"|"call", ...}], "page": 1, "pages": 1}`
+     *
+     * Dedupe key: exact SHA-1 of `from|created|kind|content` (no `id` field exists).
+     * When `kind == "call"`, `content` is an MP3 audio URL — never printed as SMS body text.
+     */
+    internal fun parseApiJsonResponse(
+        rawJson: String,
+        nowMs: Long = System.currentTimeMillis(),
+    ): ParsedApiPage {
+        val trimmed = rawJson.trim()
+        if (!trimmed.startsWith("{")) {
+            return ParsedApiPage(emptyList(), page = 1, pages = 1, validJson = false)
         }
+        val root = runCatching { json.parseToJsonElement(trimmed) as? JsonObject }.getOrNull()
+            ?: return ParsedApiPage(emptyList(), page = 1, pages = 1, validJson = false)
+        val messagesArray = root["messages"] as? JsonArray
+            ?: return ParsedApiPage(emptyList(), page = 1, pages = 1, validJson = false)
+
+        val page = (root["page"] as? JsonPrimitive)?.contentOrNull?.toIntOrNull() ?: 1
+        val pages = (root["pages"] as? JsonPrimitive)?.contentOrNull?.toIntOrNull() ?: 1
+
+        val out = ArrayList<TempParsedMessage>(messagesArray.size)
+        val seenKeys = LinkedHashSet<String>()
+
+        for (element in messagesArray) {
+            val obj = element as? JsonObject ?: continue
+            val rawFrom = obj.rawStringOrEmpty("from")
+            val rawCreated = obj.rawStringOrEmpty("created")
+            val rawKind = obj.rawStringOrEmpty("kind").ifBlank { "sms" }.lowercase()
+            val rawContent = obj.rawStringOrEmpty("content")
+
+            val dedupKey = computeDedupeKey(
+                from = rawFrom,
+                created = rawCreated,
+                kind = rawKind,
+                content = rawContent,
+            )
+            if (!seenKeys.add(dedupKey)) continue
+
+            val sender = rawFrom.trim().ifEmpty { "Unknown sender" }.take(40)
+            val ts = FlexibleTimestampParser.parse(rawCreated, nowMs)
+
+            if (rawKind == "call") {
+                val audioUrl = rawContent.trim().ifBlank { null }
+                out.add(
+                    TempParsedMessage(
+                        fromNumber = sender.take(32),
+                        senderName = sender,
+                        body = "Voice call audio",
+                        receivedAtEpochMs = ts.epochMs,
+                        hasExplicitTimestamp = ts.isExplicit,
+                        sourceTag = "sms24",
+                        messageKind = "call",
+                        audioUrl = audioUrl,
+                        overrideDedupHash = dedupKey,
+                    )
+                )
+            } else {
+                val cleanBody = PhoneFormatter.sanitizeBody(rawContent, 640)
+                if (cleanBody.isBlank() || Sms24NoiseFilter.isNonSmsPlaceholder(cleanBody)) continue
+                out.add(
+                    TempParsedMessage(
+                        fromNumber = sender.take(32),
+                        senderName = sender,
+                        body = cleanBody,
+                        receivedAtEpochMs = ts.epochMs,
+                        hasExplicitTimestamp = ts.isExplicit,
+                        sourceTag = "sms24",
+                        messageKind = "sms",
+                        audioUrl = null,
+                        overrideDedupHash = dedupKey,
+                    )
+                )
+            }
+        }
+
+        return ParsedApiPage(
+            messages = out,
+            page = page,
+            pages = pages,
+            validJson = true,
+        )
+    }
+
+    private fun JsonObject.rawStringOrEmpty(key: String): String {
+        val el = this[key] ?: return ""
+        val prim = el as? JsonPrimitive ?: return ""
+        return prim.contentOrNull ?: ""
     }
 
     internal fun isGenuinelyEmptySms24Page(html: String): Boolean {
@@ -933,6 +1001,23 @@ class Sms24HtmlAdapter(
         html: String,
         nowMs: Long = System.currentTimeMillis(),
     ): Pair<List<TempParsedMessage>, String?> {
+        // Evaluate ALL strategies and pick the highest-scoring real SMS set so a single
+        // non-SMS status/placeholder element in an earlier strategy never shadows real messages.
+        var bestMsgs: List<TempParsedMessage> = emptyList()
+        var bestStrategy: String? = null
+        var bestScore = 0
+
+        fun consider(raw: List<TempParsedMessage>, name: String) {
+            val cleaned = dedupeParsed(raw)
+            if (cleaned.isEmpty()) return
+            val sc = Sms24NoiseFilter.score(cleaned)
+            if (sc > bestScore) {
+                bestScore = sc
+                bestMsgs = cleaned
+                bestStrategy = name
+            }
+        }
+
         // Strategy A1: Classic <dt ...>...</dt><dd ...>...</dd> (preserving <dt> tag attributes!)
         val dtDdOut = mutableListOf<TempParsedMessage>()
         for (match in dtDdRegex.findAll(html)) {
@@ -940,7 +1025,7 @@ class Sms24HtmlAdapter(
             val ddBlock = match.groupValues[2]
             parseDdBlock(ddBlock = ddBlock, precedingContext = dtFullTag, nowMs = nowMs)?.let { dtDdOut.add(it) }
         }
-        if (dtDdOut.isNotEmpty()) return dedupeParsed(dtDdOut) to "dl-dt-dd-balanced"
+        consider(dtDdOut, "dl-dt-dd-balanced")
 
         // Strategy A2: Relaxed balanced <dd> extraction (handles wrapper divs, comments, <hr>, or non-adjacent <dt>)
         val ddBlocks = extractBalancedElementsWithRanges(html, "dd", ddOpenRegex)
@@ -952,22 +1037,21 @@ class Sms24HtmlAdapter(
                 val lastDt = dtFullRegex.findAll(lookback).lastOrNull()?.value ?: lookback
                 parseDdBlock(ddBlock = inner, precedingContext = lastDt, nowMs = nowMs)?.let { relaxedOut.add(it) }
             }
-            if (relaxedOut.isNotEmpty()) return dedupeParsed(relaxedOut) to "dd-relaxed-balanced"
+            consider(relaxedOut, "dd-relaxed-balanced")
         }
 
         // Strategy A3: HTML5 minified <dt>...<dd>... without optional </dt> / </dd> closing tags
-        val unclosedOut = parseUnclosedDtDd(html, nowMs)
-        if (unclosedOut.isNotEmpty()) return dedupeParsed(unclosedOut) to "dd-unclosed-html5"
+        consider(parseUnclosedDtDd(html, nowMs), "dd-unclosed-html5")
 
         // Strategy B: Universal SMS24 `From:` / `/messages/` sender link anchor parser (layout & class agnostic!)
-        val anchorOut = parseByFromMessageAnchors(html, nowMs)
-        if (anchorOut.isNotEmpty()) return dedupeParsed(anchorOut) to "from-messages-anchor"
+        consider(parseByFromMessageAnchors(html, nowMs), "from-messages-anchor")
 
         // Strategy C: `data-created` timestamp block segmentation (handles quoted & unquoted attributes)
-        val createdOut = parseByDataCreatedBlocks(html, nowMs)
-        if (createdOut.isNotEmpty()) return dedupeParsed(createdOut) to "data-created-blocks"
+        consider(parseByDataCreatedBlocks(html, nowMs), "data-created-blocks")
 
         // Strategy D: Balanced callout / card / shadow / message / list-group-item containers
+        // Requires at least one real SMS signal (sender, explicit timestamp, From:, /messages/, or data-created)
+        // so status banners like `<div class="callout">SMS inbox is ready</div>` can never match.
         val cardBlocks = BalancedHtmlExtractor.extractBalancedElements(
             html = html,
             tagName = "div",
@@ -991,6 +1075,12 @@ class Sms24HtmlAdapter(
                 ?: strongRegex.find(block)?.groupValues?.getOrNull(1)
                 ?: labelBlock
             val sender = cleanSender(senderRaw)
+            val hasSmsSignal = sender.isNotBlank() ||
+                ts.isExplicit ||
+                ts.epochMs != nowMs ||
+                block.contains("data-created", ignoreCase = true) ||
+                block.contains("/messages/", ignoreCase = true)
+            if (!hasSmsSignal) continue
             val body = extractBestBodyFromContainer(block, sender) ?: continue
             val effectiveSender = sender.ifEmpty { PhoneFormatter.guessSender("", body).ifEmpty { "SMS24" } }
             cardOut.add(
@@ -1004,17 +1094,15 @@ class Sms24HtmlAdapter(
                 )
             )
         }
-        if (cardOut.isNotEmpty()) return dedupeParsed(cardOut) to "callout-cards-balanced"
+        consider(cardOut, "callout-cards-balanced")
 
         // Strategy E: Embedded JSON payloads inside <script> tags
-        val jsonOut = parseEmbeddedJsonMessages(html, "sms24", "SMS24", nowMs)
-        if (jsonOut.isNotEmpty()) return dedupeParsed(jsonOut) to "embedded-json"
+        consider(parseEmbeddedJsonMessages(html, "sms24", "SMS24", nowMs), "embedded-json")
 
         // Strategy F: Generic HTML table rows
-        val tableOut = parseGenericHtmlTables(html, "sms24", "SMS24", nowMs)
-        if (tableOut.isNotEmpty()) return dedupeParsed(tableOut) to "html-table"
+        consider(parseGenericHtmlTables(html, "sms24", "SMS24", nowMs), "html-table")
 
-        return emptyList<TempParsedMessage>() to null
+        return bestMsgs to bestStrategy
     }
 
     private fun parseUnclosedDtDd(html: String, nowMs: Long): List<TempParsedMessage> {
@@ -1137,6 +1225,7 @@ class Sms24HtmlAdapter(
         for (raw in candidates) {
             val cleaned = PhoneFormatter.sanitizeBody(HtmlEntityDecoder.decodeHtml(raw), 640)
             if (cleaned.length < 2) continue
+            if (Sms24NoiseFilter.isNonSmsPlaceholder(cleaned)) continue
             if (sender.isNotBlank() && cleaned.equals(sender, ignoreCase = true)) continue
             if (cleaned.equals("From:", ignoreCase = true) || cleaned.equals("From", ignoreCase = true)) continue
             return cleaned
@@ -1193,13 +1282,37 @@ class Sms24HtmlAdapter(
         val matches = dataCreatedAttrRegex.findAll(html).toList()
         if (matches.isEmpty()) return emptyList()
 
-        val out = mutableListOf<TempParsedMessage>()
+        // Collapse nested duplicate data-created attributes inside the same <dt>/header wrapper
+        // (e.g. <dt data-created="..."><div data-created="...">12 mins ago</div></dt>)
+        val dedupedMatches = mutableListOf<MatchResult>()
         for (i in matches.indices) {
             val m = matches[i]
+            val next = matches.getOrNull(i + 1)
+            if (next != null && (next.range.first - m.range.first) < 180) {
+                val between = html.substring(m.range.last + 1, next.range.first)
+                if (!between.contains("</dd>", ignoreCase = true) && !between.contains("/messages/", ignoreCase = true)) {
+                    continue
+                }
+            }
+            dedupedMatches.add(m)
+        }
+
+        val out = mutableListOf<TempParsedMessage>()
+        for (i in dedupedMatches.indices) {
+            val m = dedupedMatches[i]
             val rawTime = m.groupValues[1].ifBlank { m.groupValues[2] }
             val ts = FlexibleTimestampParser.parse(rawTime, nowMs)
-            val end = if (i + 1 < matches.size) matches[i + 1].range.first else (m.range.last + 1_200).coerceAtMost(html.length)
-            val slice = html.substring(m.range.first, end.coerceAtMost(m.range.first + 1_200))
+            // Always slice on tag boundaries ('<') so raw HTML attribute fragments never leak into decoded text
+            val sliceStart = html.lastIndexOf('<', m.range.first).takeIf { it >= 0 } ?: m.range.first
+            val nextMatch = dedupedMatches.getOrNull(i + 1)
+            val nextSliceStart = if (nextMatch != null) {
+                html.lastIndexOf('<', nextMatch.range.first).takeIf { it > sliceStart } ?: nextMatch.range.first
+            } else {
+                (sliceStart + 1_400).coerceAtMost(html.length)
+            }
+            val end = nextSliceStart.coerceAtMost((sliceStart + 1_400).coerceAtMost(html.length))
+            if (end <= sliceStart) continue
+            val slice = html.substring(sliceStart, end)
 
             val labelBlock = fromLabelRegex.find(slice)?.groupValues?.getOrNull(1).orEmpty()
             val senderRaw = fromLinkRegex.find(labelBlock)?.groupValues?.getOrNull(1)
@@ -1267,6 +1380,7 @@ class Sms24HtmlAdapter(
         val seen = LinkedHashSet<String>()
         val out = ArrayList<TempParsedMessage>(items.size)
         for (item in items) {
+            if (Sms24NoiseFilter.isNonSmsPlaceholder(item.body)) continue
             val key = "${item.senderName.lowercase()}|${item.body.lowercase()}"
             if (seen.add(key)) out.add(item)
         }
@@ -1274,7 +1388,28 @@ class Sms24HtmlAdapter(
     }
 
     companion object {
-        private const val CACHE_TTL_MS = 15_000L
+        const val TOKEN_TRANSPORT = "in_page"
+        const val DEFAULT_TURNSTILE_SITEKEY = "0x4AAAAAAFQHYrfMKXcEi0gA"
+        private const val MIN_JITTER_POLL_MS = 90_000L
+        private const val MAX_JITTER_POLL_MS = 180_000L
+        private const val BACKOFF_429_MS = 120_000L
+        private const val BACKOFF_5XX_MS = 60_000L
+
+        /**
+         * Verified SMS24 dedupe key (no `id` field exists in the API response):
+         * SHA-1 hex digest of `from|created|kind|content`.
+         */
+        fun computeDedupeKey(
+            from: String,
+            created: String,
+            kind: String,
+            content: String,
+        ): String {
+            val raw = "$from|$created|$kind|$content"
+            val digest = MessageDigest.getInstance("SHA-1").digest(raw.toByteArray(StandardCharsets.UTF_8))
+            return digest.joinToString("") { "%02x".format(it) }
+        }
+
         // Capture full <dt ...>...</dt> so attributes like <dt data-created="..."> are preserved
         private val dtDdRegex = Regex("""(<dt\b[^>]*>[\s\S]*?</dt>)\s*<dd\b[^>]*>([\s\S]*?)</dd>""", RegexOption.IGNORE_CASE)
         private val dtFullRegex = Regex("""<dt\b[^>]*>[\s\S]*?</dt>""", RegexOption.IGNORE_CASE)
@@ -1325,6 +1460,80 @@ class Sms24HtmlAdapter(
     }
 }
 
+internal object Sms24NoiseFilter {
+    private val exactNoisePhrases = setOf(
+        "sms inbox is ready",
+        "inbox is ready",
+        "your sms inbox is ready",
+        "this sms inbox is ready",
+        "waiting for sms",
+        "waiting for messages",
+        "waiting for new messages",
+        "loading",
+        "loading messages",
+        "loading sms",
+        "please wait",
+        "refresh",
+        "refresh messages",
+        "refresh inbox",
+        "update messages",
+        "no messages",
+        "no messages yet",
+        "no sms",
+        "no sms yet",
+        "no sms received",
+        "copy number",
+        "copied",
+        "from:",
+        "from",
+        "message",
+        "messages",
+    )
+
+    private val pureTimestampRegex = Regex(
+        """^(?:\d+\s*(?:sec(?:ond)?s?|min(?:ute)?s?|hour?s?|hr?s?|day?s?|wk?s?|week?s?)\s+ago|(?:a|an|one)\s+(?:few\s+seconds?|sec(?:ond)?|min(?:ute)?|hour|hr|day|week)\s+ago|just now|\d{4}[-/]\d{1,2}[-/]\d{1,2}[t ]\d{1,2}:\d{2}(?::\d{2})?)$"""
+    )
+
+    fun isNonSmsPlaceholder(body: String): Boolean {
+        val norm = body.trim().lowercase().replace(Regex("""\s+"""), " ").trimEnd('.', '!', '…')
+        if (norm.length < 2) return true
+        if (norm in exactNoisePhrases) return true
+        if (pureTimestampRegex.matches(norm)) return true
+        if (norm.startsWith("data-created=") || norm.startsWith("class=\"") || norm.startsWith("href=\"")) return true
+        if (norm.startsWith("sms inbox is ready")) return true
+        if (norm.startsWith("privacy policy") || norm.startsWith("terms of service")) return true
+        if (norm.startsWith("all messages are public") || norm.startsWith("receive sms online")) return true
+        if (norm.startsWith("refresh this page")) return true
+        return false
+    }
+
+    fun score(messages: List<TempParsedMessage>, fallbackSender: String = "SMS24"): Int {
+        if (messages.isEmpty()) return 0
+        var total = 0
+        for (m in messages) {
+            if (isNonSmsPlaceholder(m.body)) continue
+            var pts = 10
+            if (m.senderName.isNotBlank() && !m.senderName.equals(fallbackSender, ignoreCase = true)) {
+                pts += 8
+            }
+            if (m.hasExplicitTimestamp) {
+                pts += 6
+            }
+            if (m.body.length >= 12) {
+                pts += 3
+            }
+            total += pts
+        }
+        return total
+    }
+
+    fun isLowConfidenceSingleFallback(messages: List<TempParsedMessage>, fallbackSender: String = "SMS24"): Boolean {
+        if (messages.size != 1) return false
+        val only = messages.first()
+        return only.senderName.equals(fallbackSender, ignoreCase = true) && !only.hasExplicitTimestamp
+    }
+}
+
 internal fun convertRenderedMessages(
     rendered: List<RenderedDomMessage>,
     sourceTag: String,
@@ -1335,7 +1544,7 @@ internal fun convertRenderedMessages(
     val seen = LinkedHashSet<String>()
     for (msg in rendered) {
         val body = PhoneFormatter.sanitizeBody(msg.body, 640)
-        if (body.length < 2) continue
+        if (body.length < 2 || Sms24NoiseFilter.isNonSmsPlaceholder(body)) continue
         val sender = msg.sender
             .replace(Regex("""(?i)^from\s*:?\s*"""), "")
             .trim()
@@ -1358,6 +1567,67 @@ internal fun convertRenderedMessages(
     return out
 }
 
+internal fun parseFlexibleJsonPayloads(
+    payloads: List<String>,
+    sourceTag: String,
+    fallbackSender: String,
+    nowMs: Long,
+): List<TempParsedMessage> {
+    val json = Json { ignoreUnknownKeys = true; isLenient = true }
+    val out = mutableListOf<TempParsedMessage>()
+    val seen = LinkedHashSet<String>()
+
+    fun walk(el: JsonElement) {
+        if (out.size >= 80) return
+        when (el) {
+            is JsonArray -> el.forEach { walk(it) }
+            is JsonObject -> {
+                val bodyRaw = el.stringField("text", "body", "message", "content", "sms", "msg", "sms_text")
+                if (!bodyRaw.isNullOrBlank()) {
+                    val cleanBody = PhoneFormatter.sanitizeBody(bodyRaw, 640)
+                    if (cleanBody.length >= 2 && !Sms24NoiseFilter.isNonSmsPlaceholder(cleanBody)) {
+                        val senderRaw = el.stringField("from", "sender", "originator", "author", "phone", "service", "number_from")
+                            .orEmpty()
+                            .replace(Regex("""(?i)^from\s*:?\s*"""), "")
+                            .trim()
+                            .take(40)
+                        val timeRaw = el.stringField("created_at", "received_at", "received", "created", "date", "time", "timestamp", "updated_at")
+                            .orEmpty()
+                        val effectiveSender = senderRaw.ifEmpty { PhoneFormatter.guessSender("", cleanBody).ifEmpty { fallbackSender } }
+                        val key = "${effectiveSender.lowercase()}|${cleanBody.lowercase()}"
+                        if (seen.add(key)) {
+                            val ts = FlexibleTimestampParser.parse(timeRaw, nowMs)
+                            out.add(
+                                TempParsedMessage(
+                                    fromNumber = effectiveSender.take(32),
+                                    senderName = effectiveSender,
+                                    body = cleanBody,
+                                    receivedAtEpochMs = ts.epochMs,
+                                    hasExplicitTimestamp = ts.isExplicit,
+                                    sourceTag = sourceTag,
+                                )
+                            )
+                        }
+                        return
+                    }
+                }
+                for (child in el.values) {
+                    if (child is JsonArray || child is JsonObject) walk(child)
+                }
+            }
+            else -> Unit
+        }
+    }
+
+    for (raw in payloads) {
+        val trimmed = raw.trim()
+        if (!trimmed.startsWith("{") && !trimmed.startsWith("[")) continue
+        val root = runCatching { json.parseToJsonElement(trimmed) }.getOrNull() ?: continue
+        walk(root)
+    }
+    return out
+}
+
 internal fun parseEmbeddedJsonMessages(
     html: String,
     sourceTag: String,
@@ -1374,7 +1644,7 @@ internal fun parseEmbeddedJsonMessages(
         val senderRaw = HtmlEntityDecoder.decodeEscapedJsonFragment(m.groupValues[1]).take(40)
         val bodyRaw = PhoneFormatter.sanitizeBody(HtmlEntityDecoder.decodeEscapedJsonFragment(m.groupValues[2]), 640)
         val timeRaw = m.groupValues[3]
-        if (bodyRaw.length < 3) continue
+        if (bodyRaw.length < 3 || Sms24NoiseFilter.isNonSmsPlaceholder(bodyRaw)) continue
         val ts = FlexibleTimestampParser.parse(timeRaw, nowMs)
         val sender = senderRaw.ifEmpty { PhoneFormatter.guessSender("", bodyRaw).ifEmpty { fallbackSender } }
         out.add(

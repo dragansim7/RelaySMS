@@ -32,4 +32,7 @@ data class MessageEntity(
     val explicitCode: String? = null,
     val serviceName: String? = null,
     val isManual: Boolean = false,
+    val kind: String = "sms",
+    val audioUrl: String? = null,
+    val localAudioPath: String? = null,
 )

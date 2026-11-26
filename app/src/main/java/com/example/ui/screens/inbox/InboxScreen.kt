@@ -29,10 +29,14 @@ import androidx.compose.material.icons.outlined.NotificationsOff
 import androidx.compose.material.icons.outlined.NotificationsNone
 import androidx.compose.material.icons.outlined.PushPin
 import androidx.compose.material.icons.outlined.Sms
+import android.media.MediaPlayer
 import androidx.compose.material.icons.rounded.AddComment
+import androidx.compose.material.icons.rounded.Call
 import androidx.compose.material.icons.rounded.Check
 import androidx.compose.material.icons.rounded.ErrorOutline
+import androidx.compose.material.icons.rounded.PlayArrow
 import androidx.compose.material.icons.rounded.PushPin
+import androidx.compose.material.icons.rounded.Stop
 import androidx.compose.material.icons.rounded.Troubleshoot
 import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
@@ -52,6 +56,7 @@ import androidx.compose.material3.pulltorefresh.PullToRefreshBox
 import androidx.compose.material3.pulltorefresh.PullToRefreshDefaults
 import androidx.compose.material3.pulltorefresh.rememberPullToRefreshState
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -771,18 +776,26 @@ private fun SmsMessageCard(
                 )
             }
 
-            Text(
-                text = message.body,
-                style = MaterialTheme.typography.bodyLarge,
-                color = colorScheme.onSurface,
-            )
-
-            if (message.extractedOtp != null) {
-                OtpCodeChip(
-                    code = message.extractedOtp,
-                    copied = copiedKey == "otp_${message.id}",
-                    onClick = { onCopyOtp(message.extractedOtp) },
+            if (message.kind == "call") {
+                CallAudioPlayerBar(
+                    messageId = message.id,
+                    localAudioPath = message.localAudioPath,
+                    audioUrl = message.audioUrl,
                 )
+            } else {
+                Text(
+                    text = message.body,
+                    style = MaterialTheme.typography.bodyLarge,
+                    color = colorScheme.onSurface,
+                )
+
+                if (message.extractedOtp != null) {
+                    OtpCodeChip(
+                        code = message.extractedOtp,
+                        copied = copiedKey == "otp_${message.id}",
+                        onClick = { onCopyOtp(message.extractedOtp) },
+                    )
+                }
             }
 
             Row(
@@ -993,3 +1006,141 @@ private fun TestSmsSimulatorCard(
         }
     }
 }
+
+@Composable
+private fun CallAudioPlayerBar(
+    messageId: Long,
+    localAudioPath: String?,
+    audioUrl: String?,
+) {
+    val colorScheme = MaterialTheme.colorScheme
+    var isPlaying by remember(messageId) { mutableStateOf(false) }
+    var playbackError by remember(messageId) { mutableStateOf<String?>(null) }
+    val playerHolder = remember(messageId) { mutableStateOf<MediaPlayer?>(null) }
+
+    DisposableEffect(messageId) {
+        onDispose {
+            runCatching {
+                playerHolder.value?.stop()
+                playerHolder.value?.release()
+            }
+            playerHolder.value = null
+        }
+    }
+
+    val audioSource = localAudioPath?.takeIf { java.io.File(it).exists() } ?: audioUrl
+
+    Surface(
+        modifier = Modifier.fillMaxWidth(),
+        shape = MaterialTheme.shapes.small,
+        color = colorScheme.surfaceContainerHigh,
+        border = BorderStroke(1.dp, colorScheme.primary.copy(alpha = 0.35f)),
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 12.dp, vertical = 10.dp),
+            verticalArrangement = Arrangement.spacedBy(6.dp),
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    Icon(
+                        imageVector = Icons.Rounded.Call,
+                        contentDescription = null,
+                        tint = colorScheme.primary,
+                        modifier = Modifier.size(18.dp),
+                    )
+                    Column {
+                        Text(
+                            text = "Voice call audio",
+                            style = MaterialTheme.typography.labelLarge,
+                            fontWeight = FontWeight.SemiBold,
+                            color = colorScheme.onSurface,
+                        )
+                        Text(
+                            text = if (localAudioPath != null && java.io.File(localAudioPath).exists()) {
+                                "Saved locally"
+                            } else if (!audioUrl.isNullOrBlank()) {
+                                "Audio recording ready"
+                            } else {
+                                "Audio unavailable"
+                            },
+                            style = MaterialTheme.typography.labelSmall,
+                            color = colorScheme.onSurfaceVariant,
+                        )
+                    }
+                }
+
+                if (!audioSource.isNullOrBlank()) {
+                    OutlinedButton(
+                        onClick = {
+                            playbackError = null
+                            if (isPlaying) {
+                                runCatching {
+                                    playerHolder.value?.stop()
+                                    playerHolder.value?.release()
+                                }
+                                playerHolder.value = null
+                                isPlaying = false
+                            } else {
+                                runCatching {
+                                    playerHolder.value?.release()
+                                    val mp = MediaPlayer().apply {
+                                        setDataSource(audioSource)
+                                        setOnPreparedListener {
+                                            isPlaying = true
+                                            start()
+                                        }
+                                        setOnCompletionListener {
+                                            isPlaying = false
+                                            it.release()
+                                            playerHolder.value = null
+                                        }
+                                        setOnErrorListener { it, _, _ ->
+                                            isPlaying = false
+                                            playbackError = "Unable to play audio clip"
+                                            it.release()
+                                            playerHolder.value = null
+                                            true
+                                        }
+                                        prepareAsync()
+                                    }
+                                    playerHolder.value = mp
+                                }.onFailure {
+                                    isPlaying = false
+                                    playbackError = "Unable to load audio clip"
+                                }
+                            }
+                        },
+                        shape = MaterialTheme.shapes.small,
+                        modifier = Modifier.testTag("play_call_audio_$messageId"),
+                    ) {
+                        Icon(
+                            imageVector = if (isPlaying) Icons.Rounded.Stop else Icons.Rounded.PlayArrow,
+                            contentDescription = if (isPlaying) "Stop call audio" else "Play call audio",
+                            modifier = Modifier.size(18.dp),
+                        )
+                        Spacer(Modifier.width(4.dp))
+                        Text(if (isPlaying) "Stop" else "Play")
+                    }
+                }
+            }
+
+            if (!playbackError.isNullOrBlank()) {
+                Text(
+                    text = playbackError!!,
+                    style = MaterialTheme.typography.labelSmall,
+                    color = colorScheme.error,
+                )
+            }
+        }
+    }
+}
+

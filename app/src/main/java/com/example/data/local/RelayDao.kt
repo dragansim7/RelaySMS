@@ -367,6 +367,33 @@ interface RelayDao {
     )
     suspend fun pruneMessagesOlderThan(cutoffEpochMs: Long, tempCutoffEpochMs: Long): Int
 
+    /**
+     * Purges any previously saved non-SMS UI placeholder/status banners (e.g. "SMS inbox is ready")
+     * from automated sync rows while never touching user-authored manual messages.
+     */
+    @Query(
+        """
+        DELETE FROM messages
+        WHERE isManual = 0
+          AND LOWER(TRIM(body)) IN (
+              'sms inbox is ready',
+              'sms inbox is ready.',
+              'inbox is ready',
+              'inbox is ready.',
+              'your sms inbox is ready',
+              'waiting for sms',
+              'waiting for messages',
+              'loading',
+              'loading...',
+              'loading messages',
+              'please wait',
+              'no messages yet',
+              'no sms received'
+          )
+        """
+    )
+    suspend fun purgePlaceholderMessages(): Int
+
     @Query("DELETE FROM numbers WHERE id IN (:ids)")
     suspend fun deleteNumbersByIds(ids: List<String>): Int
 }

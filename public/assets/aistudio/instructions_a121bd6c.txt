@@ -1,0 +1,399 @@
+# TASK: Correct the sms24.me ingestion layer
+
+The current implementation is wrong in method, transport and dedupe. It also
+generalises assumptions across five sites that were never verified. Fix sms24.me
+against the verified contract below; treat the other four as separate
+investigations.
+
+Do not re-derive the contract. It was read out of the site's production
+JavaScript bundle (`app-B4plS_UK.js`, `turnstile-Cr7KcrXV.js`).
+
+---
+
+## 1. Corrections to make immediately
+
+| Wrong | Right |
+|---|---|
+| `GET /api/messages/{number}` | `POST /api/messages/{number}` — GET returns Symfony **405** |
+| Parsing message HTML from `/en/numbers/{number}` | HTML is lazy-loaded; call the JSON API |
+| No auth | Requires `X-Turnstile-Token` header carrying a fresh token |
+| Dedupe on a message `id` | **No id field exists.** Hash `from\|created\|kind\|content` |
+| Waiting for a "Show SMS messages" click or a rewarded ad | Both are client-side only; the server checks neither |
+| Firefox/Camoufox | Chromium via **patchright** (UA-CH hints, single fingerprint family) |
+| `headless=True` | Headful under Xvfb |
+| Rotating datacenter proxies | Sticky residential, AU preferred (site resolves to SYD) |
+| Assuming all five sites behave alike | Classify each independently first |
+
+---
+
+## 2. Verified API contract
+
+```
+POST https://sms24.me/api/messages/{number}
+```
+
+Headers:
+
+```
+Accept: application/json
+Content-Type: application/json
+X-Turnstile-Token: <single-use token>
+Accept-Language: en
+```
+
+Body:
+
+```json
+{"page": 1, "locale": "en"}
+```
+
+Constraints:
+
+- **Same-origin only.** The site's wrapper throws if the URL origin differs from
+  `window.location.origin`. Either call from inside a `sms24.me` page, or call
+  from outside with the correct headers (see §4 — this is permitted and tested).
+- Token minted with `action: "messages"`, sitekey from
+  `meta[name="turnstile-site-key"]` (current value `0x4AAAAAAFQHYrfMKXcEi0gA`).
+- Tokens are single-use, expire in 300s, bound to sitekey + action. Redemption
+  state is eventually consistent, so a retry within ~5s of first redemption can
+  still succeed — use that, don't depend on it.
+- `/api/*` is **not** behind the Cloudflare managed challenge. A cookieless GET
+  reaches the Symfony origin. `cf_clearance` is not required for the API leg.
+  The page load itself is challenged, so the mint leg needs a browser.
+- `curl_cffi` with `impersonate="chrome"` is sufficient for the spend leg. Do not
+  use plain `requests` or `curl`.
+
+### Response shape
+
+```json
+{"messages": [...], "page": 1, "pages": 1}
+```
+
+Message object:
+
+| Field | Type | Notes |
+|---|---|---|
+| `from` | string | may be empty → "Unknown sender" |
+| `senderUrl` | string\|null | optional link |
+| `created` | string | timestamp, render as-is |
+| `content` | string | body, **or** an MP3 URL when `kind == "call"` |
+| `kind` | string | `"sms"` \| `"call"` |
+| `number` | string | receiving number |
+| `numberUrl` | string\|null | |
+| `country` | string | |
+| `countryUrl` | string\|null | |
+| `countryEmoji` | string\|null | |
+
+`kind == "call"` → download `content` as audio, don't print it as text.
+
+Page 1 assumed newest-first — verify on first run. `pages > 1` is backfill only.
+
+---
+
+## 3. IP binding — settled position
+
+Turnstile tokens are **not IP-bound by default**. `remoteip` is an optional
+siteverify parameter; Cloudflare documents it as "not strictly validated".
+Tokens are cookieless and carry no session. The API path is also not
+edge-challenged, so no IP+UA-bound clearance cookie applies.
+
+Therefore: **cross-IP token transport is permitted, gated on the test in §4.**
+Default to the single-leg in-page path anyway — it is correct with zero
+assumptions. Only switch to two-leg if the test passes and you need the
+throughput.
+
+Write the result as a config constant, don't leave it implicit:
+
+```python
+TOKEN_TRANSPORT = "in_page"   # or "two_leg", only after T2 passes
+```
+
+---
+
+## 4. Mandatory binding test (run before choosing an architecture)
+
+Fresh token each attempt, all within 300s. Record status and body for each.
+
+| # | Test | Purpose | Expected if unbound |
+|---|---|---|---|
+| T0 | POST with **no** token | learn the rejection shape | 403/422 + JSON or HTML error |
+| T1 | Mint on IP **A**, spend on IP **A** | baseline: token works at all | 200 + `messages` |
+| T2 | Mint on IP **A**, spend on IP **B** (different residential IP) | the actual question | 200 + `messages` |
+| T3 | Re-spend the T1 token | confirm single-use | `timeout-or-duplicate`-style failure |
+
+Decision:
+
+- **T1 passes, T2 passes** → `two_leg`. Cache tokens, refresh at 240s.
+- **T1 passes, T2 fails** → token or clearance is IP-bound. `in_page` only,
+  one sticky IP per number, mint and spend in the same context.
+- **T1 fails** → the token or something else is wrong; debug before building
+  either path.
+- **T2 returns a Cloudflare challenge page** (not an app error) → the edge has
+  started challenging `/api`. `in_page` only.
+
+Mint helper (token-only mode, prints one token):
+
+```python
+#!/usr/bin/env python3
+"""Mint one sms24.me Turnstile token. Prints it to stdout. Token-only mode."""
+import sys
+from patchright.sync_api import sync_playwright
+
+NUMBER = sys.argv[1] if len(sys.argv) > 1 else "61480001107"
+PAGE_URL = f"https://sms24.me/en/numbers/{NUMBER}"
+PROXY = {"server": "http://USER:PASS@residential-host:PORT"}  # IP A
+
+JS = """
+async () => {
+  if (!window.turnstile) {
+    await new Promise((res, rej) => {
+      const s = document.createElement('script');
+      s.src = 'https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit';
+      s.onload = res; s.onerror = () => rej(new Error('load failed'));
+      document.head.append(s);
+    });
+  }
+  const key = document.querySelector('meta[name="turnstile-site-key"]')?.content;
+  if (!key) throw new Error('sitekey missing');
+  const box = document.createElement('div');
+  document.body.append(box);
+  const tok = await new Promise((res, rej) => {
+    const t = setTimeout(() => rej(new Error('timeout')), 60000);
+    window.turnstile.render(box, {
+      sitekey: key, action: 'messages', appearance: 'interaction-only',
+      callback: (v) => { clearTimeout(t); res(v); },
+      'error-callback': () => { clearTimeout(t); rej(new Error('error')); },
+    });
+  });
+  box.remove();
+  return tok;
+}
+"""
+
+with sync_playwright() as p:
+    ctx = p.chromium.launch_persistent_context(
+        user_data_dir="/opt/sms24/mint-profile", channel="chromium",
+        headless=False, proxy=PROXY, locale="en-AU",
+        timezone_id="Australia/Sydney", viewport={"width": 1280, "height": 900},
+    )
+    page = ctx.pages[0] if ctx.pages else ctx.new_page()
+    page.goto(PAGE_URL, wait_until="domcontentloaded", timeout=90_000)
+    print(page.evaluate(JS))
+    ctx.close()
+```
+
+Spend helper (IP B):
+
+```bash
+TOKEN="$1"
+curl -sS -o /tmp/r.json -w '%{http_code}\n' \
+  'https://sms24.me/api/messages/61480001107' -X POST \
+  --proxy 'http://USER:PASS@other-residential-host:PORT' \
+  -H 'Accept: application/json' -H 'Content-Type: application/json' \
+  -H 'Accept-Language: en' -H "X-Turnstile-Token: $TOKEN" \
+  --data '{"page":1,"locale":"en"}'
+cat /tmp/r.json
+```
+
+Run with `xvfb-run -a python3 mint_token.py`. Record T0–T3 in the repo.
+
+---
+
+## 5. Reference implementation — single-leg (`in_page`)
+
+Correct with zero assumptions. Keep one long-lived context per number, mint
+in-page, fetch in-page, so cookies and clearance ride along automatically.
+
+```python
+#!/usr/bin/env python3
+"""sms24.me inbox poller. Single-leg: mint and spend inside the page."""
+import hashlib, json, random, sys, time
+from pathlib import Path
+from patchright.sync_api import sync_playwright
+
+NUMBER = sys.argv[1] if len(sys.argv) > 1 else "61480001107"
+PAGE_URL = f"https://sms24.me/en/numbers/{NUMBER}"
+API = f"/api/messages/{NUMBER}"
+PROFILE = f"/opt/sms24/profile-{NUMBER}"
+SEEN = Path(f"/opt/sms24/seen-{NUMBER}.txt")
+PROXY = {"server": "http://USER:PASS@residential-au-host:PORT"}
+
+POLL_JS = """
+async (args) => {
+  if (!window.turnstile) {
+    await new Promise((res, rej) => {
+      const s = document.createElement('script');
+      s.src = 'https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit';
+      s.onload = res; s.onerror = () => rej(new Error('turnstile load failed'));
+      document.head.append(s);
+    });
+  }
+  const key = document.querySelector('meta[name="turnstile-site-key"]')?.content;
+  if (!key) throw new Error('sitekey missing');
+  const box = document.createElement('div');
+  document.body.append(box);
+  const token = await new Promise((res, rej) => {
+    const t = setTimeout(() => rej(new Error('turnstile timeout')), 60000);
+    window.turnstile.render(box, {
+      sitekey: key, action: 'messages', appearance: 'interaction-only',
+      callback: (tok) => { clearTimeout(t); res(tok); },
+      'error-callback': () => { clearTimeout(t); rej(new Error('turnstile error')); },
+      'expired-callback': () => {},
+    });
+  });
+  box.remove();
+  const r = await fetch(args.api, {
+    method: 'POST', credentials: 'same-origin',
+    headers: {
+      'Accept': 'application/json',
+      'Content-Type': 'application/json',
+      'X-Turnstile-Token': token,
+    },
+    body: JSON.stringify({ page: args.page, locale: 'en' }),
+  });
+  return { status: r.status, body: await r.text() };
+}
+"""
+
+def key_of(m):
+    raw = f"{m.get('from')}|{m.get('created')}|{m.get('kind')}|{m.get('content')}"
+    return hashlib.sha1(raw.encode()).hexdigest()
+
+def main():
+    seen = set(SEEN.read_text().split()) if SEEN.exists() else set()
+    with sync_playwright() as p:
+        ctx = p.chromium.launch_persistent_context(
+            user_data_dir=PROFILE, channel="chromium", headless=False,
+            proxy=PROXY, viewport={"width": 1280, "height": 900},
+            locale="en-AU", timezone_id="Australia/Sydney",
+        )
+        page = ctx.pages[0] if ctx.pages else ctx.new_page()
+        page.goto(PAGE_URL, wait_until="domcontentloaded", timeout=90_000)
+
+        while True:
+            try:
+                res = page.evaluate(POLL_JS, {"api": API, "page": 1})
+                status, body = res["status"], res["body"]
+                if status in (403, 422):
+                    print(f"{status} — token rejected, reloading")
+                    page.goto(PAGE_URL, wait_until="domcontentloaded", timeout=90_000)
+                elif status == 429:
+                    print("429 — backing off"); time.sleep(120)
+                elif status >= 500:
+                    print(f"{status} — upstream error"); time.sleep(60)
+                else:
+                    data = json.loads(body)
+                    for m in data.get("messages", []):
+                        k = key_of(m)
+                        if k in seen:
+                            continue
+                        seen.add(k)
+                        if m.get("kind") == "call":
+                            print(f"[CALL] {m.get('created')} {m.get('from')} -> {m.get('content')}")
+                        else:
+                            print(f"[SMS] {m.get('created')} {m.get('from')}: {m.get('content')}")
+                        # hand off to the app here
+                    SEEN.write_text("\n".join(seen))
+            except Exception as e:
+                print("poll failed:", e)
+                try:
+                    page.goto(PAGE_URL, wait_until="domcontentloaded", timeout=90_000)
+                except Exception:
+                    pass
+            time.sleep(random.uniform(90, 180))
+
+main()
+```
+
+---
+
+## 6. Two-leg variant (only if T2 passed)
+
+Mint with `mint_token.py` on IP A, spend with `curl_cffi` on IP B. Keep a token
+pool per number: max 5 tokens, refresh at 240s (60s of margin), single-use each.
+
+```python
+import curl_cffi
+
+def spend(token, number, proxy):
+    r = curl_cffi.post(
+        f"https://sms24.me/api/messages/{number}",
+        impersonate="chrome",
+        proxy=proxy,
+        headers={
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "Accept-Language": "en",
+            "X-Turnstile-Token": token,
+        },
+        json={"page": 1, "locale": "en"},
+        timeout=20,
+    )
+    return r.status_code, r.text
+```
+
+Rules for two-leg:
+
+- Never let a token age past 240s.
+- On a 403/422, discard that token and mint a replacement before the next cycle.
+- Pin IP A and IP B to the same country. AU both, or at minimum same ASN class.
+- If T2 success rate drops below ~90% over a day, fall back to `in_page`.
+
+---
+
+## 7. Scheduling and concurrency
+
+- Jittered 90–180s per number. Fixed intervals get pattern-matched.
+- Concurrency 1–2 per egress IP. One context per number.
+- Persist the seen-hash set; load on boot so restarts don't re-emit.
+- Bound the set (30-day trim or ring buffer).
+- One reload-and-retry per failure, then wait for the next cycle.
+
+---
+
+## 8. Failure matrix
+
+| Signal | Meaning | Action |
+|---|---|---|
+| 403 + `cf-mitigated: challenge` on page | challenge not passed | reload, let the widget run |
+| 403/422 on API with token | token rejected/expired | reload, mint fresh |
+| 405 | wrong method | ensure POST |
+| 429 | throttle | back off 120s, halve concurrency |
+| 5xx | upstream fault | wait 60s |
+| `{"messages": []}` | empty inbox | not an error |
+| Widget never resolves | fingerprint/ASN | check residential egress, headful, UA-CH intact |
+
+---
+
+## 9. Acceptance criteria
+
+1. T0–T3 recorded in the repo with status codes and bodies.
+2. `TOKEN_TRANSPORT` set from the T2 result, not guessed.
+3. `GET` → 405; `POST` with a valid token → 200 + `messages`.
+4. First run on a populated number emits; second run emits nothing.
+5. Kill/restart emits no duplicates.
+6. `kind:"call"` downloaded as audio, not printed as a URL body.
+7. Forced 403 recovers within one cycle, unattended.
+8. No plain `requests` or `curl` against the page URL anywhere.
+
+---
+
+## 10. Other four sites — do not assume
+
+Quackr, TempsMSS, Receive-SMS-Free and GetVirtualPhoneNumber are unclassified.
+Probe each before coding:
+
+```bash
+curl -sS -D - -o /tmp/b.html -A "" "https://SITE/en"
+```
+
+| Response | Layer |
+|---|---|
+| 403 + `cf-mitigated: challenge` | browser, same stack as above |
+| bare 403/503 | TLS/JA3 or ASN → `curl_cffi`, then residential IP |
+| error 1020 | ASN ban → residential proxy |
+| 429 | scheduler |
+| 200 | headers may suffice; look for a JSON endpoint before parsing HTML |
+
+Do not port the Turnstile flow to a site that doesn't use it. Do not add a
+browser to a site that answers 200 to a header fix.

@@ -16,6 +16,7 @@ import com.example.data.remote.ProbeOutcome
 import com.example.data.remote.ProviderDiagnostic
 import com.example.data.remote.ProviderHealthStatus
 import com.example.data.remote.ReceiveSmssProvider
+import com.example.data.remote.Sms24NoiseFilter
 import com.example.data.remote.SourceProbeAttempt
 import com.example.data.remote.SyncHealthState
 import com.example.data.remote.TempFetchResult
@@ -101,6 +102,9 @@ data class SmsMessageModel(
     val extractedOtp: String?,
     val serviceName: String? = null,
     val isManual: Boolean = false,
+    val kind: String = "sms",
+    val audioUrl: String? = null,
+    val localAudioPath: String? = null,
 )
 
 data class InboxModel(
@@ -115,6 +119,7 @@ class RelayRepository(
     private val receiveSmssProvider: ReceiveSmssProvider,
     private val tempSourceEngine: TempSourceEngine,
     private val tempSyncScheduler: TempSyncScheduler,
+    private val callAudioDownloader: com.example.data.remote.CallAudioDownloader? = null,
 ) {
 
     private val _syncHealth = MutableStateFlow(SyncHealthState())
@@ -156,6 +161,7 @@ class RelayRepository(
         preferences.markInitialSeedDoneIfNeeded {
             dao.insertNumbersIgnore(NumberEntity.DEFAULT_LIVE_NUMBERS)
         }
+        dao.purgePlaceholderMessages()
         pruneOldMessages()
         refreshWorkManagerSchedule()
     }
@@ -206,9 +212,14 @@ class RelayRepository(
                         body = msg.body,
                         source = msg.source,
                         receivedAtEpochMs = msg.receivedAtEpochMs,
-                        extractedOtp = msg.explicitCode?.ifBlank { null } ?: OtpCodeExtractor.extract(msg.body),
+                        extractedOtp = if (msg.kind == "call") null else {
+                            msg.explicitCode?.ifBlank { null } ?: OtpCodeExtractor.extract(msg.body)
+                        },
                         serviceName = msg.serviceName,
                         isManual = msg.isManual,
+                        kind = msg.kind,
+                        audioUrl = msg.audioUrl,
+                        localAudioPath = msg.localAudioPath,
                     )
                 }
             )
@@ -304,6 +315,7 @@ class RelayRepository(
         }
 
         val startedAt = System.currentTimeMillis()
+        dao.purgePlaceholderMessages()
         dao.updateTempSyncState(
             numberId = temp.numberId,
             status = TempNumberEntity.STATUS_SYNCING,
@@ -804,38 +816,48 @@ class RelayRepository(
         var droppedByRetention = 0
         val retentionCutoff = System.currentTimeMillis() - retentionWindowMs
         for (msg in messages) {
+            if (msg.messageKind != "call" && Sms24NoiseFilter.isNonSmsPlaceholder(msg.body)) continue
             if (!keepAllHistory && msg.receivedAtEpochMs < retentionCutoff) {
                 droppedByRetention += 1
                 continue
             }
-            val hash = PhoneFormatter.computeDedupHash(numberId, msg.senderName, msg.body, msg.receivedAtEpochMs)
+            val hash = msg.overrideDedupHash
+                ?: PhoneFormatter.computeDedupHash(numberId, msg.senderName, msg.body, msg.receivedAtEpochMs)
             if (dao.countByDedupHash(numberId, hash) > 0) {
                 dupSkipped += 1
                 continue
             }
-            val windowDup = dao.countDuplicateMessage(
-                numberId = numberId,
-                senderName = msg.senderName,
-                body = msg.body,
-                fromEpochMs = msg.receivedAtEpochMs - DEDUP_WINDOW_MS,
-                toEpochMs = msg.receivedAtEpochMs + DEDUP_WINDOW_MS,
-            )
-            if (windowDup > 0) {
-                dupSkipped += 1
-                continue
-            }
-            // When source timestamps are relative or omitted, prevent duplicate inserts across re-polls
-            if (!msg.hasExplicitTimestamp) {
-                val contentDup = dao.countDuplicateByContent(
+            // Only apply fuzzy window/content dedup when the provider did not supply an exact canonical dedupe hash
+            if (msg.overrideDedupHash == null) {
+                val windowDup = dao.countDuplicateMessage(
                     numberId = numberId,
                     senderName = msg.senderName,
                     body = msg.body,
-                    sinceEpochMs = retentionCutoff,
+                    fromEpochMs = msg.receivedAtEpochMs - DEDUP_WINDOW_MS,
+                    toEpochMs = msg.receivedAtEpochMs + DEDUP_WINDOW_MS,
                 )
-                if (contentDup > 0) {
+                if (windowDup > 0) {
                     dupSkipped += 1
                     continue
                 }
+                if (!msg.hasExplicitTimestamp) {
+                    val contentDup = dao.countDuplicateByContent(
+                        numberId = numberId,
+                        senderName = msg.senderName,
+                        body = msg.body,
+                        sinceEpochMs = retentionCutoff,
+                    )
+                    if (contentDup > 0) {
+                        dupSkipped += 1
+                        continue
+                    }
+                }
+            }
+
+            val localAudioPath = if (msg.messageKind == "call" && !msg.audioUrl.isNullOrBlank()) {
+                callAudioDownloader?.downloadCallAudio(msg.audioUrl, hash)
+            } else {
+                null
             }
 
             dao.insertMessage(
@@ -850,6 +872,9 @@ class RelayRepository(
                     explicitCode = msg.explicitCode,
                     serviceName = msg.serviceName,
                     isManual = false,
+                    kind = msg.messageKind,
+                    audioUrl = msg.audioUrl,
+                    localAudioPath = localAudioPath,
                 )
             )
             added += 1

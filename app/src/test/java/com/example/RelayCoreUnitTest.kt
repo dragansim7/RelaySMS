@@ -4,10 +4,12 @@ import com.example.data.local.CustomSourceEntity
 import com.example.data.local.TempNumberEntity
 import com.example.data.remote.AnosimProvider
 import com.example.data.remote.BotWallDetector
+import com.example.data.remote.BrowserDomFetcher
 import com.example.data.remote.CustomSourceAdapter
 import com.example.data.remote.FlexibleTimestampParser
 import com.example.data.remote.GetVirtualPhoneApiAdapter
 import com.example.data.remote.HtmlEntityDecoder
+import com.example.data.remote.ProbeOutcome
 import com.example.data.remote.PublicSmsMirrorAdapter
 import com.example.data.remote.QuackrAdapter
 import com.example.data.remote.ReceiveSmsFreeAdapter
@@ -15,6 +17,8 @@ import com.example.data.remote.ReceiveSmsOnlineAdapter
 import com.example.data.remote.ReceiveSmssMirrorAdapter
 import com.example.data.remote.ReceiveSmssProvider
 import com.example.data.remote.RenderedDomMessage
+import com.example.data.remote.RenderedDomResult
+import com.example.data.remote.Sms24ApiResponse
 import com.example.data.remote.Sms24HtmlAdapter
 import com.example.data.remote.TempFetchResult
 import com.example.data.remote.TempSmssAdapter
@@ -561,24 +565,27 @@ class RelayCoreUnitTest {
         // 2. Concurrent non-force poll while a fetch is in flight MUST return SkippedInProgress (never fake Success(emptyList()))
         val requestStarted = CompletableDeferred<Unit>()
         val allowResponse = CompletableDeferred<Unit>()
-        val blockingClient = OkHttpClient.Builder()
-            .addInterceptor(Interceptor { chain ->
+        val blockingBrowser = object : BrowserDomFetcher {
+            override suspend fun renderAndExtract(url: String, referer: String?, maxWaitMs: Long): RenderedDomResult? = null
+            override suspend fun fetchSms24ApiInPage(
+                digits: String,
+                page: Int,
+                forceReload: Boolean,
+                maxWaitMs: Long,
+            ): Sms24ApiResponse {
                 requestStarted.complete(Unit)
-                runBlocking { allowResponse.await() }
-                Response.Builder()
-                    .request(chain.request())
-                    .protocol(Protocol.HTTP_1_1)
-                    .code(200)
-                    .message("OK")
-                    .body(
-                        """<dl><dt data-created="2026-11-24 07:45:12">5 mins ago</dt><dd><label>From: <a class="placeholder ms-1" href="/en/messages/Google">Google</a></label><span class="placeholder text-break">Code 123456</span></dd></dl>"""
-                            .toResponseBody("text/html".toMediaType())
-                    )
-                    .build()
-            })
-            .build()
+                allowResponse.await()
+                return Sms24ApiResponse(
+                    status = 200,
+                    body = """{"messages":[{"from":"Google","senderUrl":null,"created":"2026-11-24 07:45:12","content":"Code 123456","kind":"sms","number":"$digits"}],"page":1,"pages":1}""",
+                    finalUrl = "https://sms24.me/en/numbers/$digits",
+                    sitekeyFound = true,
+                    tokenObtained = true,
+                )
+            }
+        }
 
-        val engine = TempSourceEngine(blockingClient)
+        val engine = TempSourceEngine(OkHttpClient(), browserFetcher = blockingBrowser)
         val temp = TempNumberEntity(
             numberId = "61400667111",
             e164 = "+61400667111",
@@ -600,5 +607,162 @@ class RelayCoreUnitTest {
         assertTrue(finalResult is TempFetchResult.Success)
         assertEquals(1, (finalResult as TempFetchResult.Success).messages.size)
         assertEquals("Code 123456", finalResult.messages.first().body)
+    }
+
+    @Test
+    fun sms24VerifiedPostApiContract_dedupeCallAudio403RecoveryAndBackoffs() = runBlocking {
+        assertEquals("in_page", Sms24HtmlAdapter.TOKEN_TRANSPORT)
+        assertEquals("0x4AAAAAAFQHYrfMKXcEi0gA", Sms24HtmlAdapter.DEFAULT_TURNSTILE_SITEKEY)
+
+        // Ensure Sms24HtmlAdapter NEVER issues plain HTTP GET requests against /en/numbers/{number}
+        var rawHttpCalls = 0
+        val guardClient = OkHttpClient.Builder()
+            .addInterceptor(Interceptor { chain ->
+                rawHttpCalls += 1
+                throw AssertionError("Sms24HtmlAdapter must not issue plain HTTP calls: ${chain.request().url}")
+            })
+            .build()
+
+        // 1. Forced 403 on first attempt recovers within the SAME cycle via reload (forceReload = true)
+        val callFlags = mutableListOf<Boolean>()
+        val apiJson = """
+            {
+              "messages": [
+                {
+                  "from": "Google",
+                  "senderUrl": "/en/messages/Google",
+                  "created": "2026-11-24 22:45:00",
+                  "content": "G-519204 is your Google verification code.",
+                  "kind": "sms",
+                  "number": "61480001107",
+                  "country": "Australia"
+                },
+                {
+                  "from": "",
+                  "senderUrl": null,
+                  "created": "2026-11-24 22:40:00",
+                  "content": "https://cdn.sms24.me/calls/rec-991.mp3",
+                  "kind": "call",
+                  "number": "61480001107",
+                  "country": "Australia"
+                },
+                {
+                  "from": "Google",
+                  "senderUrl": "/en/messages/Google",
+                  "created": "2026-11-24 22:45:00",
+                  "content": "G-519204 is your Google verification code.",
+                  "kind": "sms",
+                  "number": "61480001107",
+                  "country": "Australia"
+                }
+              ],
+              "page": 1,
+              "pages": 1
+            }
+        """.trimIndent()
+
+        val recoveringBrowser = object : BrowserDomFetcher {
+            override suspend fun renderAndExtract(url: String, referer: String?, maxWaitMs: Long): RenderedDomResult? = null
+            override suspend fun fetchSms24ApiInPage(
+                digits: String,
+                page: Int,
+                forceReload: Boolean,
+                maxWaitMs: Long,
+            ): Sms24ApiResponse {
+                callFlags.add(forceReload)
+                return if (!forceReload) {
+                    Sms24ApiResponse(
+                        status = 403,
+                        body = """{"error":"turnstile token rejected"}""",
+                        finalUrl = "https://sms24.me/en/numbers/$digits",
+                        sitekeyFound = true,
+                        tokenObtained = true,
+                    )
+                } else {
+                    Sms24ApiResponse(
+                        status = 200,
+                        body = apiJson,
+                        finalUrl = "https://sms24.me/en/numbers/$digits",
+                        sitekeyFound = true,
+                        tokenObtained = true,
+                        pageReloaded = true,
+                    )
+                }
+            }
+        }
+
+        val sms24 = Sms24HtmlAdapter(guardClient, recoveringBrowser)
+        val result = sms24.fetch("+61480001107", force = true)
+        assertEquals(0, rawHttpCalls)
+        assertEquals(listOf(false, true), callFlags)
+        assertTrue(result is TempFetchResult.Success)
+        val msgs = (result as TempFetchResult.Success).messages
+        // Exact SHA-1(from|created|kind|content) deduplicated the duplicate Google message
+        assertEquals(2, msgs.size)
+        assertEquals("Google", msgs[0].senderName)
+        assertEquals("sms", msgs[0].messageKind)
+        assertEquals("G-519204 is your Google verification code.", msgs[0].body)
+        assertEquals(
+            Sms24HtmlAdapter.computeDedupeKey("Google", "2026-11-24 22:45:00", "sms", "G-519204 is your Google verification code."),
+            msgs[0].overrideDedupHash,
+        )
+
+        // Empty from -> "Unknown sender"; kind == "call" stores MP3 URL in audioUrl, NEVER in body
+        assertEquals("Unknown sender", msgs[1].senderName)
+        assertEquals("call", msgs[1].messageKind)
+        assertEquals("https://cdn.sms24.me/calls/rec-991.mp3", msgs[1].audioUrl)
+        assertFalse(msgs[1].body.contains("http"))
+        assertFalse(msgs[1].body.contains(".mp3"))
+        assertEquals(
+            Sms24HtmlAdapter.computeDedupeKey("", "2026-11-24 22:40:00", "call", "https://cdn.sms24.me/calls/rec-991.mp3"),
+            msgs[1].overrideDedupHash,
+        )
+
+        // 2. Immediate non-forced poll hits the jittered 90–180s cache without calling WebView again
+        val cachedRes = sms24.fetch("+61480001107", force = false)
+        assertTrue(cachedRes is TempFetchResult.Success && cachedRes.fromCache)
+        assertEquals(2, callFlags.size)
+
+        // 3. Empty inbox `{"messages": []}` returns confirmed Success(emptyList) with EMPTY_INBOX outcome
+        val emptyBrowser = object : BrowserDomFetcher {
+            override suspend fun renderAndExtract(url: String, referer: String?, maxWaitMs: Long): RenderedDomResult? = null
+            override suspend fun fetchSms24ApiInPage(digits: String, page: Int, forceReload: Boolean, maxWaitMs: Long) =
+                Sms24ApiResponse(200, """{"messages":[],"page":1,"pages":1}""", "https://sms24.me/en/numbers/$digits", sitekeyFound = true, tokenObtained = true)
+        }
+        val emptyRes = Sms24HtmlAdapter(guardClient, emptyBrowser).fetch("+61400667111", force = true)
+        assertTrue(emptyRes is TempFetchResult.Success)
+        assertTrue((emptyRes as TempFetchResult.Success).messages.isEmpty())
+        assertEquals(ProbeOutcome.EMPTY_INBOX, emptyRes.attempts.last().outcome)
+
+        // 4. HTTP 429 triggers 120s backoff and HTTP 503 triggers 60s backoff
+        val throttleBrowser = object : BrowserDomFetcher {
+            override suspend fun renderAndExtract(url: String, referer: String?, maxWaitMs: Long): RenderedDomResult? = null
+            override suspend fun fetchSms24ApiInPage(digits: String, page: Int, forceReload: Boolean, maxWaitMs: Long) =
+                Sms24ApiResponse(429, "Too Many Requests", "https://sms24.me/en/numbers/$digits")
+        }
+        val throttleAdapter = Sms24HtmlAdapter(guardClient, throttleBrowser)
+        val throttleRes = throttleAdapter.fetch("+61480001107", force = true)
+        assertTrue(throttleRes is TempFetchResult.Failure)
+        assertEquals(TempNumberEntity.STATUS_RATE_LIMITED, (throttleRes as TempFetchResult.Failure).status)
+        assertEquals(120_000L, throttleRes.retryAfterMs)
+
+        val err503Browser = object : BrowserDomFetcher {
+            override suspend fun renderAndExtract(url: String, referer: String?, maxWaitMs: Long): RenderedDomResult? = null
+            override suspend fun fetchSms24ApiInPage(digits: String, page: Int, forceReload: Boolean, maxWaitMs: Long) =
+                Sms24ApiResponse(503, "Service Unavailable", "https://sms24.me/en/numbers/$digits")
+        }
+        val err503Res = Sms24HtmlAdapter(guardClient, err503Browser).fetch("+61480001107", force = true)
+        assertTrue(err503Res is TempFetchResult.Failure)
+        assertEquals(60_000L, (err503Res as TempFetchResult.Failure).retryAfterMs)
+
+        // 5. HTTP 405 Method Not Allowed fails cleanly with POST diagnostic
+        val err405Browser = object : BrowserDomFetcher {
+            override suspend fun renderAndExtract(url: String, referer: String?, maxWaitMs: Long): RenderedDomResult? = null
+            override suspend fun fetchSms24ApiInPage(digits: String, page: Int, forceReload: Boolean, maxWaitMs: Long) =
+                Sms24ApiResponse(405, "Method Not Allowed", "https://sms24.me/en/numbers/$digits")
+        }
+        val err405Res = Sms24HtmlAdapter(guardClient, err405Browser).fetch("+61480001107", force = true)
+        assertTrue(err405Res is TempFetchResult.Failure)
+        assertTrue((err405Res as TempFetchResult.Failure).errorMessage.contains("405"))
     }
 }
