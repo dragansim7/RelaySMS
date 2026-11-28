@@ -3,14 +3,20 @@ package com.example.ui.screens.numbers
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
+import com.example.data.local.MessageSearchMatchRow
 import com.example.data.remote.SyncHealthState
 import com.example.data.repository.NumberCardModel
 import com.example.data.repository.RelayRepository
+import com.example.domain.PhoneFormatter
+import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.flatMapLatest
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
@@ -46,6 +52,7 @@ private data class NumbersFilterState(
     val errorMessage: String? = null,
 )
 
+@OptIn(ExperimentalCoroutinesApi::class)
 class NumbersViewModel(
     private val repository: RelayRepository,
 ) : ViewModel() {
@@ -62,12 +69,18 @@ class NumbersViewModel(
         }
     }
 
+    private val messageSearchMatchesFlow = filterState
+        .map { it.searchQuery.trim() }
+        .distinctUntilChanged()
+        .flatMapLatest { query -> repository.observeMessageSearchMatches(query) }
+
     val uiState: StateFlow<NumbersUiState> = combine(
         repository.observeNumberCards(),
+        messageSearchMatchesFlow,
         filterState,
         repository.syncHealth,
         clockTick,
-    ) { rows, filter, health, nowMs ->
+    ) { rows, messageMatches, filter, health, nowMs ->
         val countryMap = linkedMapOf<String, String>()
         rows.forEach { countryMap[it.countryCode] = it.countryName }
         val countries = countryMap.entries.map { CountryOption(it.key, it.value) }
@@ -78,18 +91,22 @@ class NumbersViewModel(
             "ALL"
         }
 
-        val needle = filter.searchQuery.trim().lowercase()
-        val filtered = rows.filter { row ->
-            if (effectiveCountry != "ALL" && row.countryCode != effectiveCountry) return@filter false
-            if (needle.isEmpty()) return@filter true
-            val hay = "${row.e164} ${row.label} ${row.carrier} ${row.countryName} ${row.senderName.orEmpty()} ${row.preview.orEmpty()}".lowercase()
-            hay.contains(needle)
-        }
+        val filtered = filterAndSortNumbers(
+            rows = rows,
+            messageMatches = messageMatches,
+            searchQuery = filter.searchQuery,
+            selectedCountry = effectiveCountry,
+        )
 
-        val featured = filtered.firstOrNull { it.isPinned }
-            ?: filtered.firstOrNull { it.countryCode == "AU" && it.lastAtEpochMs != null }
-            ?: filtered.firstOrNull()
-        val rest = if (featured == null) emptyList() else filtered.filter { it.id != featured.id }
+        val isSearching = filter.searchQuery.trim().isNotEmpty()
+        val featured = if (isSearching) {
+            null
+        } else {
+            filtered.firstOrNull { it.isPinned }
+                ?: filtered.firstOrNull { it.countryCode == "AU" && it.lastAtEpochMs != null }
+                ?: filtered.firstOrNull()
+        }
+        val rest = if (featured == null) filtered else filtered.filter { it.id != featured.id }
         val dayTotal = rows.sumOf { it.dayCount }
 
         NumbersUiState(
@@ -179,6 +196,44 @@ class NumbersViewModel(
     }
 
     companion object {
+        internal fun filterAndSortNumbers(
+            rows: List<NumberCardModel>,
+            messageMatches: Map<String, MessageSearchMatchRow>,
+            searchQuery: String,
+            selectedCountry: String,
+        ): List<NumberCardModel> {
+            val needle = searchQuery.trim().lowercase()
+            val countryFiltered = rows.filter { row ->
+                selectedCountry == "ALL" || row.countryCode == selectedCountry
+            }
+            if (needle.isEmpty()) {
+                return countryFiltered
+            }
+
+            return countryFiltered.mapNotNull { row ->
+                val msgMatch = messageMatches[row.id]
+                val localFormatted = PhoneFormatter.localFormat(row.e164)
+                val hay = "${row.e164} $localFormatted ${row.label} ${row.carrier} ${row.countryName} ${row.senderName.orEmpty()} ${row.preview.orEmpty()}".lowercase()
+                val matchesMetadata = hay.contains(needle)
+                if (msgMatch == null && !matchesMetadata) {
+                    null
+                } else if (msgMatch != null) {
+                    row.copy(
+                        searchMatchCount = msgMatch.matchCount,
+                        searchMatchBody = msgMatch.latestMatchBody,
+                        searchMatchSender = msgMatch.latestMatchSender,
+                        searchMatchEpochMs = msgMatch.latestMatchEpochMs,
+                    )
+                } else {
+                    row
+                }
+            }.sortedWith(
+                compareByDescending<NumberCardModel> { it.searchMatchEpochMs ?: it.lastAtEpochMs ?: Long.MIN_VALUE }
+                    .thenByDescending { it.searchMatchCount }
+                    .thenBy { it.label.lowercase() }
+            )
+        }
+
         fun factory(repository: RelayRepository): ViewModelProvider.Factory =
             object : ViewModelProvider.Factory {
                 @Suppress("UNCHECKED_CAST")

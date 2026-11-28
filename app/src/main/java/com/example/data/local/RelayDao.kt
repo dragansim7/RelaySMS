@@ -56,6 +56,14 @@ data class MessageTimestampRow(
     val receivedAtEpochMs: Long,
 )
 
+data class MessageSearchMatchRow(
+    val numberId: String,
+    val matchCount: Int,
+    val latestMatchEpochMs: Long,
+    val latestMatchBody: String,
+    val latestMatchSender: String,
+)
+
 @Dao
 interface RelayDao {
 
@@ -241,6 +249,47 @@ interface RelayDao {
 
     @Query("SELECT numberId, receivedAtEpochMs FROM messages")
     fun observeAllMessageTimestamps(): Flow<List<MessageTimestampRow>>
+
+    @Query(
+        """
+        SELECT
+            m.numberId AS numberId,
+            COUNT(*) AS matchCount,
+            MAX(m.receivedAtEpochMs) AS latestMatchEpochMs,
+            (
+                SELECT m2.body FROM messages m2
+                WHERE m2.numberId = m.numberId
+                  AND (
+                      LOWER(m2.body) LIKE :escapedPattern ESCAPE '\'
+                      OR LOWER(m2.senderName) LIKE :escapedPattern ESCAPE '\'
+                      OR LOWER(m2.fromNumber) LIKE :escapedPattern ESCAPE '\'
+                      OR LOWER(COALESCE(m2.serviceName, '')) LIKE :escapedPattern ESCAPE '\'
+                  )
+                ORDER BY m2.receivedAtEpochMs DESC, m2.id DESC
+                LIMIT 1
+            ) AS latestMatchBody,
+            (
+                SELECT m2.senderName FROM messages m2
+                WHERE m2.numberId = m.numberId
+                  AND (
+                      LOWER(m2.body) LIKE :escapedPattern ESCAPE '\'
+                      OR LOWER(m2.senderName) LIKE :escapedPattern ESCAPE '\'
+                      OR LOWER(m2.fromNumber) LIKE :escapedPattern ESCAPE '\'
+                      OR LOWER(COALESCE(m2.serviceName, '')) LIKE :escapedPattern ESCAPE '\'
+                  )
+                ORDER BY m2.receivedAtEpochMs DESC, m2.id DESC
+                LIMIT 1
+            ) AS latestMatchSender
+        FROM messages m
+        WHERE LOWER(m.body) LIKE :escapedPattern ESCAPE '\'
+           OR LOWER(m.senderName) LIKE :escapedPattern ESCAPE '\'
+           OR LOWER(m.fromNumber) LIKE :escapedPattern ESCAPE '\'
+           OR LOWER(COALESCE(m.serviceName, '')) LIKE :escapedPattern ESCAPE '\'
+        GROUP BY m.numberId
+        ORDER BY latestMatchEpochMs DESC
+        """
+    )
+    fun observeMessageSearchMatches(escapedPattern: String): Flow<List<MessageSearchMatchRow>>
 
     @Query("SELECT COUNT(*) FROM numbers WHERE active = 1")
     fun observeActiveNumberCount(): Flow<Int>

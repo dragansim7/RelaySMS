@@ -10,7 +10,7 @@
     <string name="stat_day_total">In 24 hours</string>
     <string name="stat_retention">Retention</string>
     <string name="stat_retention_value">48h</string>
-    <string name="search_placeholder">Search number, carrier, or sender</string>
+    <string name="search_placeholder">Search messages, numbers, or senders</string>
     <string name="filter_all">All</string>
     <string name="action_select">Select</string>
     <string name="action_done">Done</string>
@@ -25,7 +25,7 @@
     <string name="status_inactive">Inactive</string>
     <string name="notice_public_warning">Anyone can read these inboxes. Do not use them for banking, password recovery, or anything you would not put on a noticeboard.</string>
     <string name="empty_pool">No lines in the pool yet. Add a line from Connect or restore default live lines.</string>
-    <string name="empty_search">No lines match that search filter.</string>
+    <string name="empty_search">No lines or messages match that search.</string>
     <string name="empty_inbox">Nothing received yet. Pull to refresh, send a test SMS, or test an inbound webhook payload.</string>
     <string name="action_restore_defaults">Restore live lines</string>
     <string name="inbox_title">Inbox</string>

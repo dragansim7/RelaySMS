@@ -2,6 +2,7 @@ package com.example.data.repository
 
 import com.example.data.local.CustomSourceEntity
 import com.example.data.local.MessageEntity
+import com.example.data.local.MessageSearchMatchRow
 import com.example.data.local.NumberEntity
 import com.example.data.local.NumberSummaryRow
 import com.example.data.local.RelayDao
@@ -37,6 +38,8 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.flowOf
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.update
 
 data class NumberCardModel(
@@ -66,6 +69,10 @@ data class NumberCardModel(
     val isProviderLive: Boolean = false,
     val isProviderDegraded: Boolean = false,
     val providerError: String? = null,
+    val searchMatchCount: Int = 0,
+    val searchMatchBody: String? = null,
+    val searchMatchSender: String? = null,
+    val searchMatchEpochMs: Long? = null,
 ) {
     val isHostedBuiltIn: Boolean
         get() = !isTemp && (providerType == NumberEntity.PROVIDER_ANOSIM || providerType == NumberEntity.PROVIDER_RECEIVESMSS)
@@ -189,6 +196,20 @@ class RelayRepository(
                 }
                 row.toCardModel(unseenCount = unseen, health = health)
             }
+        }
+    }
+
+    fun observeMessageSearchMatches(rawQuery: String): Flow<Map<String, MessageSearchMatchRow>> {
+        val trimmed = rawQuery.trim()
+        if (trimmed.isEmpty()) return flowOf(emptyMap())
+        val escaped = trimmed
+            .lowercase()
+            .replace("\\", "\\\\")
+            .replace("%", "\\%")
+            .replace("_", "\\_")
+        val pattern = "%$escaped%"
+        return dao.observeMessageSearchMatches(pattern).map { rows ->
+            rows.associateBy { it.numberId }
         }
     }
 

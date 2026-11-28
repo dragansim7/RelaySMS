@@ -342,7 +342,15 @@ fun NumbersScreen(
 
                 // Featured Line or Empty State
                 val featured = state.featuredNumber
-                if (featured != null) {
+                if (state.filteredNumbers.isEmpty()) {
+                    item(key = "empty_state") {
+                        EmptyPoolCard(
+                            isPoolEmpty = state.allNumbers.isEmpty(),
+                            onRestoreDefaults = viewModel::onRestoreDefaultLines,
+                            onNavigateConnect = onNavigateConnect,
+                        )
+                    }
+                } else if (featured != null) {
                     item(key = "featured_${featured.id}") {
                         NumberLineCard(
                             row = featured,
@@ -356,14 +364,6 @@ fun NumbersScreen(
                                 if (state.isManaging) viewModel.onToggleSelection(featured.id)
                                 else onOpenInbox(featured.id)
                             },
-                        )
-                    }
-                } else {
-                    item(key = "empty_state") {
-                        EmptyPoolCard(
-                            isPoolEmpty = state.allNumbers.isEmpty(),
-                            onRestoreDefaults = viewModel::onRestoreDefaultLines,
-                            onNavigateConnect = onNavigateConnect,
                         )
                     }
                 }
@@ -687,6 +687,22 @@ private fun NumberLineCard(
                             color = colorScheme.primary,
                         )
                     }
+                    if (row.searchMatchCount > 0) {
+                        Surface(
+                            shape = CircleShape,
+                            color = colorScheme.primaryContainer,
+                            border = BorderStroke(1.dp, colorScheme.primary.copy(alpha = 0.5f)),
+                            modifier = Modifier.testTag("match_count_badge_${row.id}"),
+                        ) {
+                            Text(
+                                text = if (row.searchMatchCount == 1) "1 match" else "${row.searchMatchCount} matches",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = colorScheme.primary,
+                                fontWeight = FontWeight.Bold,
+                                modifier = Modifier.padding(horizontal = 7.dp, vertical = 2.dp),
+                            )
+                        }
+                    }
                     if (row.unseenCount > 0 && !row.isMuted) {
                         Surface(
                             shape = CircleShape,
@@ -724,9 +740,12 @@ private fun NumberLineCard(
 
                 Spacer(Modifier.height(8.dp))
 
-                val previewText = if (!row.preview.isNullOrBlank()) {
-                    if (!row.senderName.isNullOrBlank()) "${row.senderName}: ${row.preview}"
-                    else row.preview
+                val hasMessageMatch = row.searchMatchCount > 0 && !row.searchMatchBody.isNullOrBlank()
+                val effectivePreview = if (hasMessageMatch) row.searchMatchBody else row.preview
+                val effectiveSender = if (hasMessageMatch) row.searchMatchSender else row.senderName
+                val previewText = if (!effectivePreview.isNullOrBlank()) {
+                    if (!effectiveSender.isNullOrBlank()) "$effectiveSender: $effectivePreview"
+                    else effectivePreview
                 } else {
                     "No messages yet"
                 }
@@ -734,7 +753,11 @@ private fun NumberLineCard(
                 Text(
                     text = previewText,
                     style = MaterialTheme.typography.bodyMedium,
-                    color = if (row.preview.isNullOrBlank()) colorScheme.onSurfaceVariant.copy(alpha = 0.65f) else colorScheme.onSurfaceVariant,
+                    color = when {
+                        hasMessageMatch -> colorScheme.onSurface
+                        effectivePreview.isNullOrBlank() -> colorScheme.onSurfaceVariant.copy(alpha = 0.65f)
+                        else -> colorScheme.onSurfaceVariant
+                    },
                     maxLines = 2,
                     overflow = TextOverflow.Ellipsis,
                 )
@@ -751,6 +774,7 @@ private fun NumberLineCard(
                 }
             }
 
+            val displayTimestampMs = row.searchMatchEpochMs ?: row.lastAtEpochMs
             Column(
                 horizontalAlignment = Alignment.End,
                 verticalArrangement = Arrangement.spacedBy(2.dp),
@@ -767,13 +791,13 @@ private fun NumberLineCard(
                     style = MaterialTheme.typography.labelSmall,
                     color = colorScheme.onSurfaceVariant,
                 )
-                if (row.lastAtEpochMs != null) {
+                if (displayTimestampMs != null) {
                     Spacer(Modifier.height(6.dp))
                     Text(
-                        text = RelativeTimeFormatter.formatRelative(row.lastAtEpochMs, nowMs),
+                        text = RelativeTimeFormatter.formatRelative(displayTimestampMs, nowMs),
                         fontFamily = JetBrainsMonoFamily,
                         style = MaterialTheme.typography.labelSmall,
-                        color = colorScheme.onSurfaceVariant,
+                        color = if (row.searchMatchEpochMs != null) colorScheme.primary else colorScheme.onSurfaceVariant,
                     )
                 }
             }

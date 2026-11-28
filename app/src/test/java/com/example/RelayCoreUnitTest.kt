@@ -1,6 +1,7 @@
 package com.example
 
 import com.example.data.local.CustomSourceEntity
+import com.example.data.local.MessageSearchMatchRow
 import com.example.data.local.TempNumberEntity
 import com.example.data.remote.AnosimProvider
 import com.example.data.remote.BotWallDetector
@@ -29,6 +30,7 @@ import com.example.domain.OtpCodeExtractor
 import com.example.domain.PhoneFormatter
 import com.example.domain.RelativeTimeFormatter
 import com.example.domain.WebhookPayloadParser
+import com.example.ui.screens.numbers.NumbersViewModel
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.async
 import kotlinx.coroutines.runBlocking
@@ -764,5 +766,124 @@ class RelayCoreUnitTest {
         val err405Res = Sms24HtmlAdapter(guardClient, err405Browser).fetch("+61480001107", force = true)
         assertTrue(err405Res is TempFetchResult.Failure)
         assertTrue((err405Res as TempFetchResult.Failure).errorMessage.contains("405"))
+    }
+
+    @Test
+    fun dashboardSearch_filtersAllMessagesAndSortsNewestToOldest() {
+        val tOld = 1_795_500_000_000L
+        val tMid = 1_795_505_000_000L
+        val tNew = 1_795_509_000_000L
+
+        val pinnedOlderLine = NumberCardModel(
+            id = "61480001107",
+            e164 = "+61480001107",
+            countryCode = "AU",
+            countryName = "Australia",
+            label = "Pinned AU",
+            carrier = "SMS24.me",
+            providerType = "temp_auto",
+            dayCount = 4,
+            lastAtEpochMs = tNew, // latest overall message is unrelated
+            preview = "Latest unrelated alert",
+            senderName = "Other",
+            unseenCount = 0,
+            isPinned = true,
+        )
+        val unpinnedNewerMatchLine = NumberCardModel(
+            id = "61485841378",
+            e164 = "+61485841378",
+            countryCode = "AU",
+            countryName = "Australia",
+            label = "Anosim AU",
+            carrier = "Anosim.net",
+            providerType = "anosim",
+            dayCount = 2,
+            lastAtEpochMs = tNew,
+            preview = "Another latest message",
+            senderName = "Service",
+            unseenCount = 0,
+            isPinned = false,
+        )
+        val metadataMatchLine = NumberCardModel(
+            id = "61400667111",
+            e164 = "+61400667111",
+            countryCode = "AU",
+            countryName = "Australia",
+            label = "Google Lab Line",
+            carrier = "SMS24.me",
+            providerType = "temp_auto",
+            dayCount = 1,
+            lastAtEpochMs = tMid,
+            preview = "Hi there",
+            senderName = "Test",
+            unseenCount = 0,
+        )
+        val unrelatedLine = NumberCardModel(
+            id = "14155550101",
+            e164 = "+14155550101",
+            countryCode = "US",
+            countryName = "United States",
+            label = "US Line",
+            carrier = "Receive-SMSS",
+            providerType = "receivesmss",
+            dayCount = 1,
+            lastAtEpochMs = tNew,
+            preview = "Uber code 1234",
+            senderName = "Uber",
+            unseenCount = 0,
+        )
+
+        val rows = listOf(pinnedOlderLine, unpinnedNewerMatchLine, metadataMatchLine, unrelatedLine)
+
+        val dbMatches = mapOf(
+            // Older match on the PINNED line
+            "61480001107" to MessageSearchMatchRow(
+                numberId = "61480001107",
+                matchCount = 1,
+                latestMatchEpochMs = tOld,
+                latestMatchBody = "Your Google code is 111222",
+                latestMatchSender = "Google",
+            ),
+            // Newer match on an UNPINNED line (3 matches total)
+            "61485841378" to MessageSearchMatchRow(
+                numberId = "61485841378",
+                matchCount = 3,
+                latestMatchEpochMs = tNew,
+                latestMatchBody = "G-999888 is your Google verification code",
+                latestMatchSender = "Google",
+            ),
+        )
+
+        val results = NumbersViewModel.filterAndSortNumbers(
+            rows = rows,
+            messageMatches = dbMatches,
+            searchQuery = "Google",
+            selectedCountry = "ALL",
+        )
+
+        // Excludes unrelatedLine; sorts strictly newest to oldest even though 61480001107 is pinned
+        assertEquals(listOf("61485841378", "61400667111", "61480001107"), results.map { it.id })
+        assertEquals(3, results[0].searchMatchCount)
+        assertEquals("G-999888 is your Google verification code", results[0].searchMatchBody)
+        assertEquals(tNew, results[0].searchMatchEpochMs)
+
+        // Label/metadata match has searchMatchCount == 0 and keeps its original preview
+        assertEquals(0, results[1].searchMatchCount)
+        assertEquals("Hi there", results[1].preview)
+
+        // Pinned line with older matching message sorts last and surfaces the matching message preview
+        assertEquals(1, results[2].searchMatchCount)
+        assertEquals("Your Google code is 111222", results[2].searchMatchBody)
+        assertEquals(tOld, results[2].searchMatchEpochMs)
+
+        // Clearing search restores original order without search match metadata
+        val cleared = NumbersViewModel.filterAndSortNumbers(
+            rows = rows,
+            messageMatches = emptyMap(),
+            searchQuery = "   ",
+            selectedCountry = "ALL",
+        )
+        assertEquals(rows.map { it.id }, cleared.map { it.id })
+        assertTrue(cleared.all { it.searchMatchCount == 0 })
     }
 }
